@@ -4,6 +4,7 @@ const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, buildAgentForUrl, getProxyHost } = require('./proxy-helper')
+const usageTracker = require('./usage-tracker')
 
 // Errors that look like the proxy is dead (TCP-level / DNS / handshake).
 // Anything in this set on a proxied request triggers proxy failover.
@@ -20,25 +21,46 @@ function isProxyShapedError(err) {
 }
 
 /**
- * Resolve the proxy URL for the current account. If the account has no
- * binding yet, the pool will lazily assign one. When no pool is
- * configured the legacy single-proxy (config.proxyUrl via getProxyAgent)
- * is used instead.
+ * Resolve the proxy decision for the current account. Returns the
+ * three-mode object so callers can distinguish "no pool / no fixed url
+ * → fall back to legacy single-proxy" from "operator explicitly chose
+ * direct connection".
+ *
+ *   - mode='none'  → skip legacy fallback entirely (force direct)
+ *   - mode='fixed' → use proxyUrl if set, else fall back to legacy
+ *   - mode='smart' → pool binding if present, else fall back to legacy
+ *
  * @param {string} email
- * @returns {Promise<string|null>}
+ * @returns {Promise<{mode:'smart'|'fixed'|'none', proxyUrl:string|null}>}
  */
 async function resolveAccountProxy(email) {
-    if (!email) return null
-    if (!accountManager.proxyPool) return null
-    return await accountManager.getProxyForAccount(email)
+    if (!email) return { mode: 'smart', proxyUrl: null }
+    if (typeof accountManager.getProxyDecisionForAccount === 'function') {
+        return await accountManager.getProxyDecisionForAccount(email)
+    }
+    // Legacy path (account-manager older than this feature) — preserve
+    // the old "string-or-null" contract by widening it here.
+    if (!accountManager.proxyPool) return { mode: 'smart', proxyUrl: null }
+    const url = await accountManager.getProxyForAccount(email)
+    return { mode: 'smart', proxyUrl: url }
 }
 
 /**
  * Send chat request
  * Retries up to config.proxyMaxRetries times when the proxy looks dead.
  * Each retry asks the smart pool for a fresh binding.
+ *
+ * Side-effect: usageTracker.recordAccountAttempt is called on each
+ * attempt, recordAccountFailure on per-attempt errors. Stream-level
+ * success / token counts are NOT recorded here — the caller must
+ * attach `usageTracker.attachStreamTracker(response, { apiKey, email })`
+ * once it has the stream, since the upstream stream is consumed by the
+ * caller and we don't want to double-instrument it.
+ *
  * @param {Object} body - Request body
- * @returns {Promise<Object>} Response result
+ * @returns {Promise<{status:boolean,response:Object|null,currentToken?:string,currentEmail?:string}>}
+ *          On success: { status:true, response:stream, currentToken, currentEmail }.
+ *          On failure: { status:false, response:null }.
  */
 const sendChatRequest = async (body) => {
     // Wait for the (lazy, async) account-manager init before doing
@@ -69,7 +91,14 @@ const sendChatRequest = async (body) => {
             return { status: false, response: null }
         }
 
-        const currentProxy = await resolveAccountProxy(currentEmail)
+        // Bump per-account "totalRequests" counter for this attempt. A
+        // single client request that retries N times will count as N
+        // attempts on the rotated accounts — that's intentional, it
+        // matches "what was actually asked of each upstream account".
+        try { usageTracker.recordAccountAttempt({ email: currentEmail }) } catch { /* never block on stats */ }
+
+        const proxyDecision = await resolveAccountProxy(currentEmail)
+        const currentProxy = proxyDecision.proxyUrl
 
         try {
             const chatBaseUrl = getChatBaseUrl()
@@ -99,16 +128,26 @@ const sendChatRequest = async (body) => {
                 timeout: 60 * 1000,
             }
 
-            // Prefer the smart-pool binding when available; fall back to
-            // the legacy single-proxy (config.proxyUrl) otherwise.
-            const agent = currentProxy ? buildAgentForUrl(currentProxy) : getProxyAgent()
+            // Agent selection rules:
+            //   - mode='none'  → no agent, force direct (skip legacy fallback)
+            //   - currentProxy set → build a per-URL agent
+            //   - else (smart with no pool / fixed with no URL) → legacy
+            //     single-proxy fallback (config.proxyUrl) if configured
+            let agent = null
+            if (proxyDecision.mode === 'none') {
+                agent = null
+            } else if (currentProxy) {
+                agent = buildAgentForUrl(currentProxy)
+            } else {
+                agent = getProxyAgent()
+            }
             if (agent) {
                 requestConfig.httpAgent = agent
                 requestConfig.httpsAgent = agent
                 requestConfig.proxy = false
             }
 
-            const chat_id = await generateChatID(currentToken, body.model, currentEmail, currentProxy)
+            const chat_id = await generateChatID(currentToken, body.model, currentEmail, currentProxy, proxyDecision.mode)
 
             logger.network(`Sending chat request (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(currentProxy)})`, 'REQUEST')
             const response = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id, {
@@ -120,19 +159,25 @@ const sendChatRequest = async (body) => {
             if (response.status === 200) {
                 return {
                     currentToken: currentToken,
+                    currentEmail: currentEmail,
                     status: true,
                     response: response.data
                 }
             }
             lastError = new Error(`Request failed with status code ${response.status}`)
+            try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
         } catch (error) {
             lastError = error
+            try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
             logger.error(`Chat request failed (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(currentProxy)}): ${error.message}`, 'REQUEST')
 
             // Only proxy-shaped errors are retryable. Auth errors, 4xx and
             // upstream-format failures should bail immediately so the
             // caller sees the real reason instead of "after 3 retries".
-            if (currentProxy && currentEmail && isProxyShapedError(error) && attempt < MAX_RETRIES) {
+            // Smart mode rotates to a new proxy; fixed mode marks failed
+            // but doesn't rebind (operator's intent is "always this proxy");
+            // direct mode never reaches here.
+            if (currentProxy && currentEmail && proxyDecision.mode === 'smart' && isProxyShapedError(error) && attempt < MAX_RETRIES) {
                 logger.warn('Proxy-shaped failure — rotating proxy and retrying', 'PROXY')
                 await accountManager.handleNetworkFailure(currentEmail, currentProxy)
                 continue
@@ -153,9 +198,12 @@ const sendChatRequest = async (body) => {
  * @param {string} model - Model name
  * @param {string} [email] - Account email (for proxy lookup)
  * @param {string} [proxyUrl] - Proxy URL (overrides legacy single-proxy)
+ * @param {'smart'|'fixed'|'none'} [proxyMode] - Account proxy mode; when
+ *        'none' we skip the legacy single-proxy fallback that would
+ *        otherwise kick in for null proxyUrl.
  * @returns {Promise<string|null>} Generated chat_id or null
  */
-const generateChatID = async (currentToken, model, email = null, proxyUrl = null) => {
+const generateChatID = async (currentToken, model, email = null, proxyUrl = null, proxyMode = 'smart') => {
     try {
         const chatBaseUrl = getChatBaseUrl()
 
@@ -182,7 +230,14 @@ const generateChatID = async (currentToken, model, email = null, proxyUrl = null
             }
         }
 
-        const agent = proxyUrl ? buildAgentForUrl(proxyUrl) : getProxyAgent()
+        let agent = null
+        if (proxyMode === 'none') {
+            agent = null
+        } else if (proxyUrl) {
+            agent = buildAgentForUrl(proxyUrl)
+        } else {
+            agent = getProxyAgent()
+        }
         if (agent) {
             requestConfig.httpAgent = agent
             requestConfig.httpsAgent = agent

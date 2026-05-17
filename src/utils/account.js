@@ -531,21 +531,122 @@ class Account {
     }
 
     /**
+     * Resolve the proxy decision for an account based on its mode:
+     *   - 'none'  → { mode: 'none', proxyUrl: null }            never use a proxy, including legacy single-proxy
+     *   - 'fixed' → { mode: 'fixed', proxyUrl: <fixedProxyUrl> } always use this exact proxy (or null if not set)
+     *   - 'smart' → { mode: 'smart', proxyUrl: <pool binding> } current behavior; lazily binds if needed
+     *
+     * Default for accounts without an explicit mode: 'smart', matching
+     * pre-feature behavior.
+     *
+     * Caller (request.js) reads `mode` to decide whether to fall back to
+     * the legacy single-proxy (`getProxyAgent()`) on a null proxyUrl —
+     * 'smart' with no pool / 'fixed' with no fixedProxyUrl falls through
+     * to legacy; 'none' explicitly does not.
+     *
+     * @param {string} email
+     * @returns {Promise<{mode:'smart'|'fixed'|'none', proxyUrl:string|null}>}
+     */
+    async getProxyDecisionForAccount(email) {
+        const acc = this.accountTokens.find(a => a.email === email)
+        const mode = (acc && acc.proxyMode) || 'smart'
+
+        if (mode === 'none') {
+            return { mode: 'none', proxyUrl: null }
+        }
+
+        if (mode === 'fixed') {
+            const url = (acc && acc.fixedProxyUrl) || null
+            return { mode: 'fixed', proxyUrl: url }
+        }
+
+        // 'smart' (default): use the pool's lazy assignment.
+        if (!this.proxyPool || this.proxyPool.size() === 0) {
+            return { mode: 'smart', proxyUrl: null }
+        }
+        const bound = this.proxyPool.getProxyForAccount(email)
+        if (bound) return { mode: 'smart', proxyUrl: bound }
+        const assigned = await this.proxyPool.assignProxy(email)
+        if (assigned && acc) acc.proxy = assigned
+        return { mode: 'smart', proxyUrl: assigned || null }
+    }
+
+    /**
      * Lookup the proxy URL bound to an account, lazily assigning one on
      * first use so cold start doesn't probe every proxy upfront.
      * Returns null when no pool is configured (callers treat as direct).
+     *
+     * Legacy thin-wrapper around getProxyDecisionForAccount; kept so
+     * older callers that don't care about the mode keep working.
      * @param {string} email
      */
     async getProxyForAccount(email) {
-        if (!this.proxyPool || this.proxyPool.size() === 0) return null
-        const bound = this.proxyPool.getProxyForAccount(email)
-        if (bound) return bound
-        const assigned = await this.proxyPool.assignProxy(email)
-        if (assigned) {
-            const acc = this.accountTokens.find(a => a.email === email)
-            if (acc) acc.proxy = assigned
+        const decision = await this.getProxyDecisionForAccount(email)
+        return decision.proxyUrl
+    }
+
+    /**
+     * Set per-account proxy mode + optional fixed URL. Validates:
+     *   - mode ∈ {'smart','fixed','none'}
+     *   - mode==='fixed' requires a non-empty proxyUrl that
+     *     buildAgentForUrl can parse (otherwise the request layer would
+     *     silently fall back to legacy getProxyAgent on every call)
+     *   - 'smart'/'none' clear fixedProxyUrl
+     *
+     * Side-effects:
+     *   - Persists the new fields via saveAccount.
+     *   - When transitioning OUT of 'smart' (to 'fixed' or 'none') the
+     *     existing pool binding is torn down so the email no longer
+     *     consumes a slot on a pool member.
+     *   - Refreshes the account rotator's snapshot.
+     *
+     * @param {string} email
+     * @param {'smart'|'fixed'|'none'} mode
+     * @param {string|null} fixedProxyUrl  required iff mode==='fixed'
+     * @returns {Promise<{ok:boolean, error?:string}>}
+     */
+    async setAccountProxy(email, mode, fixedProxyUrl) {
+        if (!['smart', 'fixed', 'none'].includes(mode)) {
+            return { ok: false, error: 'Invalid mode' }
         }
-        return assigned
+        const account = this.accountTokens.find(t => t.email === email)
+        if (!account) return { ok: false, error: 'Account not found' }
+
+        let url = null
+        if (mode === 'fixed') {
+            url = (fixedProxyUrl || '').trim()
+            if (!url) return { ok: false, error: 'fixed mode requires proxyUrl' }
+            // Validate parseable. buildAgentForUrl returns null for
+            // unknown schemes / malformed URLs.
+            const { buildAgentForUrl: build } = require('./proxy-helper')
+            if (!build(url)) return { ok: false, error: 'Unsupported or malformed proxy URL' }
+        }
+
+        const wasSmart = (account.proxyMode || 'smart') === 'smart'
+        account.proxyMode = mode
+        account.fixedProxyUrl = url
+
+        try {
+            await this.dataPersistence.saveAccount(email, {
+                password: account.password,
+                token: account.token,
+                expires: account.expires,
+                disabled: !!account.disabled,
+                proxyMode: mode,
+                fixedProxyUrl: url,
+            })
+        } catch { /* logged inside */ }
+
+        // If we're leaving 'smart' mode, hand back any pool binding so
+        // the email doesn't keep consuming a slot on a pool member.
+        if (wasSmart && mode !== 'smart' && this.proxyPool) {
+            try { await this.proxyPool.removeBinding(email) } catch { /* logged inside */ }
+            account.proxy = null
+        }
+
+        this.accountRotator.setAccounts(this.accountTokens)
+        logger.info(`Account ${email} proxy mode -> ${mode}${url ? ` (${getProxyHost(url)})` : ''}`, 'PROXY')
+        return { ok: true }
     }
 
     /**
@@ -553,16 +654,35 @@ class Account {
      * one. Called from request.js when an upstream call dies with a
      * proxy-shaped network error. The pool may re-test the failed entry
      * later — this is not a permanent eviction.
+     *
+     * Mode-aware:
+     *   - 'smart': mark failed + rebind via pool (current behavior)
+     *   - 'fixed': mark failed but do NOT rebind — the operator pinned
+     *     this proxy on purpose; rotating defeats the intent. Caller
+     *     gets null and the next attempt will fail on the same proxy
+     *     (which is what surfaces the misconfiguration to the operator).
+     *   - 'none': should never reach here (no proxy was used) but be
+     *     defensive: just no-op.
+     *
      * @param {string} email
      * @param {string} proxyUrl
      */
     async handleNetworkFailure(email, proxyUrl) {
         if (!this.proxyPool) return null
-        logger.info(`Network failure on ${email} via ${getProxyHost(proxyUrl)}`, 'PROXY')
+        const acc = this.accountTokens.find(a => a.email === email)
+        const mode = (acc && acc.proxyMode) || 'smart'
+        if (mode === 'none') return null
+
+        logger.info(`Network failure on ${email} via ${getProxyHost(proxyUrl)} (mode=${mode})`, 'PROXY')
         await this.proxyPool.markProxyAsFailed(proxyUrl)
+        if (mode !== 'smart') {
+            // Fixed-mode: don't pick a different proxy; the operator's
+            // intent is "always this one". Caller will see no fallback
+            // and surface the failure.
+            return null
+        }
         const next = await this.proxyPool.assignProxy(email, true)
         if (next) {
-            const acc = this.accountTokens.find(a => a.email === email)
             if (acc) acc.proxy = next
             logger.success(`Re-bound ${email} -> ${getProxyHost(next)}`, 'PROXY')
         } else {

@@ -8,6 +8,7 @@ const { sendChatRequest } = require('../utils/request.js')
 const { parseToolCallsFromText } = require('../utils/toolcall.js')
 const { logger } = require('../utils/logger')
 const config = require('../config/index.js')
+const usageTracker = require('../utils/usage-tracker.js')
 
 /**
  * Anthropic API key verification middleware
@@ -44,6 +45,9 @@ const handleAnthropicMessages = async (req, res) => {
     const requestedModel = anthropicBody.model || 'qwen3.6-plus'
     const isStream = anthropicBody.stream || false
 
+    // Stats: bump the API key bucket once per client request.
+    try { usageTracker.recordRequestStart({ apiKey: req.apiKey }) } catch { /* swallow */ }
+
     // Convert Anthropic request to OpenAI format
     const openaiBody = anthropicToOpenAI(anthropicBody)
 
@@ -62,11 +66,20 @@ const handleAnthropicMessages = async (req, res) => {
     const response_data = await sendChatRequest(req.body)
 
     if (!response_data.status || !response_data.response) {
+      try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
       return res.status(500).json({
         type: 'error',
         error: { type: 'api_error', message: 'Failed to send request to upstream' }
       })
     }
+
+    // Passive token-count sniffer + success/failure finalizer.
+    try {
+      usageTracker.attachStreamTracker(response_data.response, {
+        apiKey: req.apiKey,
+        email: response_data.currentEmail,
+      })
+    } catch { /* swallow */ }
 
     if (isStream) {
       // Streaming: convert OpenAI SSE to Anthropic SSE
@@ -83,6 +96,7 @@ const handleAnthropicMessages = async (req, res) => {
       res.json(anthropicResponse)
     }
   } catch (error) {
+    try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
     logger.error('Anthropic Messages API error', 'ANTHROPIC', '', error)
     res.status(500).json({
       type: 'error',

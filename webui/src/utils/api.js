@@ -79,6 +79,19 @@ export async function setAccountDisabled(email, disabled) {
 }
 
 /**
+ * Configure the proxy mode for a single Qwen account.
+ *   - mode='smart' (default behavior, pool with failover)
+ *   - mode='fixed' (must pass a parseable proxyUrl, e.g. socks5://host:port)
+ *   - mode='none'  (always go direct, even if PROXY_URL env is set)
+ */
+export async function setAccountProxy(email, mode, proxyUrl) {
+  return apiFetch('/api/setAccountProxy', {
+    method: 'POST',
+    body: JSON.stringify({ email, mode, proxyUrl: proxyUrl || null }),
+  })
+}
+
+/**
  * Manually push the current in-memory accounts / proxies / disabled list
  * to the Vercel project's env vars. Triggers a Vercel build as a side
  * effect (~60s startup), which is why we don't auto-sync on every
@@ -125,6 +138,29 @@ export async function deleteApiKey(key) {
   })
 }
 
+/* ----- usage stats ----- */
+
+/**
+ * Fetch the full usage snapshot. Returns the parsed object directly
+ * (not a wrapper), shape: { apiKeys: [...], accounts: [...], summary }.
+ */
+export async function fetchUsage() {
+  return apiFetch(API_ENDPOINTS.USAGE)
+}
+
+/**
+ * Reset usage counters. Scope:
+ *   - 'all'                 → wipe everything
+ *   - 'apikey' + { id }     → reset one bucket by snapshot id
+ *   - 'account' + { email } → reset one account bucket
+ */
+export async function resetUsage(payload) {
+  return apiFetch(API_ENDPOINTS.USAGE_RESET, {
+    method: 'POST',
+    body: JSON.stringify(payload || { scope: 'all' }),
+  })
+}
+
 /* ----- smart proxy pool ----- */
 
 export async function fetchProxies() {
@@ -143,6 +179,23 @@ export async function removeProxy(url) {
   return apiFetch('/api/proxy', {
     method: 'DELETE',
     body: JSON.stringify({ url }),
+  })
+}
+
+/**
+ * Run a one-shot connectivity probe through the given proxy.
+ *
+ * target='qwen' (default): probe the actual Qwen base URL — the most
+ * useful signal for "is this proxy actually usable for our traffic".
+ * target='generic': cheap gstatic + cloudflare ladder, matches the
+ * pool's internal selection probes.
+ *
+ * Returns { ok, status, latencyMs, error? }.
+ */
+export async function testProxy(url, target = 'qwen') {
+  return apiFetch('/api/proxy/test', {
+    method: 'POST',
+    body: JSON.stringify({ url, target }),
   })
 }
 

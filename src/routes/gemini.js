@@ -7,6 +7,7 @@ const { sendChatRequest } = require('../utils/request.js')
 const { parseToolCallsFromText } = require('../utils/toolcall.js')
 const { logger } = require('../utils/logger')
 const config = require('../config/index.js')
+const usageTracker = require('../utils/usage-tracker.js')
 
 /**
  * Gemini API key verification middleware
@@ -50,6 +51,9 @@ const handleGenerateContent = async (req, res) => {
     const geminiBody = req.body
     const urlModel = extractModelFromParam(req.params.model)
 
+    // Stats: bump api-key bucket once per client request.
+    try { usageTracker.recordRequestStart({ apiKey: req.apiKey }) } catch { /* swallow */ }
+
     // Convert Gemini request to OpenAI format
     const openaiBody = geminiToOpenAI(geminiBody, urlModel)
     openaiBody.stream = true // upstream always streams, we accumulate
@@ -67,16 +71,26 @@ const handleGenerateContent = async (req, res) => {
     const response_data = await sendChatRequest(req.body)
 
     if (!response_data.status || !response_data.response) {
+      try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
       return res.status(500).json({
         error: { code: 500, message: 'Failed to send request to upstream', status: 'INTERNAL' }
       })
     }
+
+    // Passive sniffer for token counts + success/failure finalization.
+    try {
+      usageTracker.attachStreamTracker(response_data.response, {
+        apiKey: req.apiKey,
+        email: response_data.currentEmail,
+      })
+    } catch { /* swallow */ }
 
     // Accumulate response
     const openaiResponse = await accumulateResponse(response_data.response, req.toolcall_enabled)
     const geminiResponse = openaiToGeminiResponse(openaiResponse)
     res.json(geminiResponse)
   } catch (error) {
+    try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
     logger.error('Gemini generateContent error', 'GEMINI', '', error)
     res.status(500).json({
       error: { code: 500, message: error.message || 'Internal server error', status: 'INTERNAL' }
@@ -91,6 +105,9 @@ const handleStreamGenerateContent = async (req, res) => {
   try {
     const geminiBody = req.body
     const urlModel = extractModelFromParam(req.params.model)
+
+    // Stats: bump api-key bucket once per client request.
+    try { usageTracker.recordRequestStart({ apiKey: req.apiKey }) } catch { /* swallow */ }
 
     // Convert Gemini request to OpenAI format
     const openaiBody = geminiToOpenAI(geminiBody, urlModel)
@@ -109,10 +126,19 @@ const handleStreamGenerateContent = async (req, res) => {
     const response_data = await sendChatRequest(req.body)
 
     if (!response_data.status || !response_data.response) {
+      try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
       return res.status(500).json({
         error: { code: 500, message: 'Failed to send request to upstream', status: 'INTERNAL' }
       })
     }
+
+    // Passive sniffer for token counts + success/failure finalization.
+    try {
+      usageTracker.attachStreamTracker(response_data.response, {
+        apiKey: req.apiKey,
+        email: response_data.currentEmail,
+      })
+    } catch { /* swallow */ }
 
     // Stream response in Gemini format
     res.set({
@@ -122,6 +148,7 @@ const handleStreamGenerateContent = async (req, res) => {
     })
     streamOpenAIToGemini(res, response_data.response)
   } catch (error) {
+    try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
     logger.error('Gemini streamGenerateContent error', 'GEMINI', '', error)
     res.status(500).json({
       error: { code: 500, message: error.message || 'Internal server error', status: 'INTERNAL' }

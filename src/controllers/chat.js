@@ -5,6 +5,7 @@ const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
 const { createSieve, parseToolCallsFromText } = require('../utils/toolcall.js')
+const usageTracker = require('../utils/usage-tracker.js')
 
 /**
  * Set response headers
@@ -420,13 +421,29 @@ const handleChatCompletion = async (req, res) => {
     const enable_thinking = req.enable_thinking
     const enable_web_search = req.enable_web_search
 
+    // Record one client-level "totalRequest" against the API key bucket.
+    // Per-account totals are bumped inside sendChatRequest; per-request
+    // success/failure is bumped here once the stream/JSON completes.
+    try { usageTracker.recordRequestStart({ apiKey: req.apiKey }) } catch { /* never block on stats */ }
+
     try {
         const response_data = await sendChatRequest(req.body)
 
         if (!response_data.status || !response_data.response) {
+            try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
             res.status(500).json({ error: "Failed to send request" })
             return
         }
+
+        // Passive sniffer on the upstream stream — finalizes success +
+        // token counts on 'end', failure on 'error'. Doesn't consume
+        // the stream; the existing handler is the primary consumer.
+        try {
+            usageTracker.attachStreamTracker(response_data.response, {
+                apiKey: req.apiKey,
+                email: response_data.currentEmail,
+            })
+        } catch { /* swallow */ }
 
         if (stream) {
             setResponseHeaders(res, true)
@@ -437,6 +454,7 @@ const handleChatCompletion = async (req, res) => {
         }
 
     } catch (error) {
+        try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
         logger.error('Chat processing error', 'CHAT', '', error)
         res.status(500).json({ error: "Invalid token, request failed" })
     }
