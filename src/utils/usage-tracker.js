@@ -38,6 +38,7 @@
 const crypto = require('crypto')
 const DataPersistence = require('./data-persistence')
 const { logger } = require('./logger')
+const { createUsageObject } = require('./precise-tokenizer')
 
 const FLUSH_INTERVAL_MS = 30 * 1000
 const ANON_ID = '(anonymous)'
@@ -269,10 +270,22 @@ class UsageTracker {
    * attach passive listeners. The downstream handler is still the
    * primary consumer; we just sniff alongside it.
    *
+   * Two fallbacks for token counting, mirroring what the chat controller
+   * already does for the user-facing `usage` chunk:
+   *   1. If upstream Qwen sends a `usage` field in any SSE chunk, we
+   *      take the latest snapshot.
+   *   2. If upstream never sends `usage` (the common case for Qwen —
+   *      that's why chat.js controller has its own createUsageObject
+   *      fallback), we estimate from the original promptMessages and
+   *      the accumulated answer text observed in `delta.content`.
+   *
    * Returns the same stream for fluent chaining.
    *
    * @param {NodeJS.ReadableStream} stream — upstream SSE response
-   * @param {{ apiKey, email }} ctx
+   * @param {{ apiKey, email, promptMessages? }} ctx
+   *        promptMessages is the original OpenAI-format messages array
+   *        (or string). Without it the prompt-side fallback estimate
+   *        is 0; the response-side fallback still works either way.
    */
   attachStreamTracker(stream, ctx) {
     if (!stream || typeof stream.on !== 'function') return stream
@@ -280,6 +293,14 @@ class UsageTracker {
     const decoder = new (require('util').TextDecoder)('utf-8')
     let buffer = ''
     let lastUsage = null
+    // Accumulate the answer text we observe so we can estimate
+    // completion_tokens when upstream doesn't ship a usage chunk.
+    // We sniff `delta.content` (the answer phase) and
+    // `delta.reasoning_content` (the thinking phase, when the user
+    // enabled it via the -thinking suffix). Both contribute to the
+    // upstream-reported completion_tokens in the controller's
+    // estimator, so we count them the same way here.
+    let completionText = ''
     let finished = false
 
     const onData = (chunk) => {
@@ -304,6 +325,17 @@ class UsageTracker {
                 completion_tokens: Number(parsed.usage.completion_tokens) || 0,
               }
             }
+            // Sniff the visible response content for the fallback
+            // estimator. Qwen wraps answer text under
+            // choices[0].delta.content with phase='answer'; thinking
+            // text shows up under .reasoning_content (when enabled)
+            // OR under .content with phase='think'. Either way,
+            // .content + .reasoning_content captures everything.
+            const delta = parsed.choices && parsed.choices[0] && parsed.choices[0].delta
+            if (delta) {
+              if (typeof delta.content === 'string') completionText += delta.content
+              if (typeof delta.reasoning_content === 'string') completionText += delta.reasoning_content
+            }
           } catch { /* skip malformed */ }
         }
       } catch { /* defensive: never crash the stream */ }
@@ -314,7 +346,30 @@ class UsageTracker {
       finished = true
       try {
         if (ok) {
-          tracker.recordSuccess({ apiKey: ctx && ctx.apiKey, email: ctx && ctx.email, usage: lastUsage || {} })
+          // Resolve usage with the same precedence the chat controller
+          // uses for the response it sends back to the client:
+          //   real upstream usage  >  estimated from text
+          let resolvedUsage = lastUsage
+          if (!resolvedUsage || (!resolvedUsage.prompt_tokens && !resolvedUsage.completion_tokens)) {
+            try {
+              const estimated = createUsageObject(
+                ctx && ctx.promptMessages ? ctx.promptMessages : '',
+                completionText,
+                null
+              )
+              resolvedUsage = {
+                prompt_tokens: estimated.prompt_tokens || 0,
+                completion_tokens: estimated.completion_tokens || 0,
+              }
+            } catch {
+              resolvedUsage = { prompt_tokens: 0, completion_tokens: 0 }
+            }
+          }
+          tracker.recordSuccess({
+            apiKey: ctx && ctx.apiKey,
+            email: ctx && ctx.email,
+            usage: resolvedUsage,
+          })
         } else {
           tracker.recordFailure({ apiKey: ctx && ctx.apiKey })
           if (ctx && ctx.email) tracker.recordAccountFailure({ email: ctx.email })

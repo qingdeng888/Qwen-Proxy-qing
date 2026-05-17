@@ -78,10 +78,13 @@ const handleGenerateContent = async (req, res) => {
     }
 
     // Passive sniffer for token counts + success/failure finalization.
+    // Forward promptMessages (post-conversion OpenAI form) so the
+    // tracker can estimate when upstream omits usage.
     try {
       usageTracker.attachStreamTracker(response_data.response, {
         apiKey: req.apiKey,
         email: response_data.currentEmail,
+        promptMessages: req.body && req.body.messages,
       })
     } catch { /* swallow */ }
 
@@ -137,6 +140,7 @@ const handleStreamGenerateContent = async (req, res) => {
       usageTracker.attachStreamTracker(response_data.response, {
         apiKey: req.apiKey,
         email: response_data.currentEmail,
+        promptMessages: req.body && req.body.messages,
       })
     } catch { /* swallow */ }
 

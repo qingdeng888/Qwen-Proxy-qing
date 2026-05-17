@@ -438,10 +438,15 @@ const handleChatCompletion = async (req, res) => {
         // Passive sniffer on the upstream stream — finalizes success +
         // token counts on 'end', failure on 'error'. Doesn't consume
         // the stream; the existing handler is the primary consumer.
+        // promptMessages is forwarded so the tracker can estimate
+        // prompt_tokens when upstream omits the usage field (Qwen
+        // typically does — see the createUsageObject fallback in the
+        // stream/non-stream handlers below).
         try {
             usageTracker.attachStreamTracker(response_data.response, {
                 apiKey: req.apiKey,
                 email: response_data.currentEmail,
+                promptMessages: req.body && req.body.messages,
             })
         } catch { /* swallow */ }
 
