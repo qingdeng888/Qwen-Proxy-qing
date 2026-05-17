@@ -267,10 +267,11 @@ router.post('/proxy/add', adminKeyVerify, async (req, res) => {
     if (!url || typeof url !== 'string') {
       return res.status(400).json({ error: 'Missing url' })
     }
-    if (!accountManager.proxyPool) {
-      return res.status(400).json({ error: 'Proxy pool not initialized' })
-    }
-    const ok = await accountManager.proxyPool.addProxy(url.trim())
+    // accountManager.addProxyToPool() lazily constructs the pool when
+    // it doesn't exist yet (fresh deploy with no PROXIES env var).
+    // Without this, the very first proxy can never be added from the
+    // UI — the chicken-and-egg /proxy/add 400 reported by users.
+    const ok = await accountManager.addProxyToPool(url.trim())
     // Persistence (file/redis) handled inside addProxy. No auto Vercel
     // sync — operator triggers it from the Vercel page.
     res.json({ success: ok, url })
@@ -299,7 +300,10 @@ router.post('/proxy/test', adminKeyVerify, async (req, res) => {
       return res.status(400).json({ error: 'Missing url' })
     }
     if (!accountManager.proxyPool) {
-      return res.status(400).json({ error: 'Proxy pool not initialized' })
+      // No pool ⇒ the URL definitely isn't tracked. 404 is more
+      // honest than the legacy 400 "not initialized" which sounded
+      // like a server-side bug to operators.
+      return res.status(404).json({ error: 'Proxy not in pool — add it first' })
     }
     const result = await accountManager.proxyPool.testProxy(url, { target })
     res.json({ url, ...result })
@@ -320,7 +324,10 @@ router.delete('/proxy', adminKeyVerify, async (req, res) => {
       return res.status(400).json({ error: 'Missing url' })
     }
     if (!accountManager.proxyPool) {
-      return res.status(400).json({ error: 'Proxy pool not initialized' })
+      // Nothing to remove. Treat as a no-op success rather than an
+      // error so idempotent UI flows (delete after pool was empty)
+      // don't surface a misleading 400.
+      return res.json({ success: false, url })
     }
     const ok = await accountManager.proxyPool.removeProxy(url)
     res.json({ success: ok, url })
