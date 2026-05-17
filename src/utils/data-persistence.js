@@ -213,6 +213,7 @@ class DataPersistence {
     if (!Array.isArray(data.accounts)) data.accounts = []
     if (!data.proxyBindings || typeof data.proxyBindings !== 'object') data.proxyBindings = {}
     if (!data.proxyStatuses || typeof data.proxyStatuses !== 'object') data.proxyStatuses = {}
+    if (!data.usage || typeof data.usage !== 'object') data.usage = {}
     return data
   }
 
@@ -411,6 +412,54 @@ class DataPersistence {
     if (config.dataSaveMode === 'redis') {
       const blob = await this._readRedisBlob()
       blob.apiKeys = list
+      return this._writeRedisBlob(blob)
+    }
+    return false
+  }
+
+  /* -------------------- usage stats persistence -------------------- */
+  // The usage slice is one object: { apiKeys: { [keyHash]: counters },
+  //                                   accounts: { [email]: counters } }
+  // Counters: { totalRequests, successRequests, failedRequests,
+  //             promptTokens, completionTokens, lastUsed }
+  // The whole blob is loaded once at boot and saved with debounced writes
+  // by UsageTracker — DataPersistence just owns the read/write primitives.
+
+  async loadUsage() {
+    if (config.dataSaveMode === 'file') {
+      try {
+        await this._ensureDataFileExists()
+        const data = JSON.parse(await fs.readFile(this.dataFilePath, 'utf-8'))
+        return (data.usage && typeof data.usage === 'object') ? data.usage : {}
+      } catch (error) {
+        logger.error('Failed to load usage stats', 'DATA', '', error)
+        return {}
+      }
+    }
+    if (config.dataSaveMode === 'redis') {
+      const blob = await this._readRedisBlob()
+      return (blob.usage && typeof blob.usage === 'object') ? blob.usage : {}
+    }
+    return {}
+  }
+
+  async saveUsage(usage) {
+    const obj = (usage && typeof usage === 'object') ? usage : {}
+    if (config.dataSaveMode === 'file') {
+      try {
+        await this._ensureDataFileExists()
+        const data = JSON.parse(await fs.readFile(this.dataFilePath, 'utf-8'))
+        data.usage = obj
+        await fs.writeFile(this.dataFilePath, JSON.stringify(data, null, 2), 'utf-8')
+        return true
+      } catch (error) {
+        logger.error('Failed to save usage stats', 'DATA', '', error)
+        return false
+      }
+    }
+    if (config.dataSaveMode === 'redis') {
+      const blob = await this._readRedisBlob()
+      blob.usage = obj
       return this._writeRedisBlob(blob)
     }
     return false

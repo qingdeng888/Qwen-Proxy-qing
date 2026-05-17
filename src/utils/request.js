@@ -4,6 +4,7 @@ const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, buildAgentForUrl, getProxyHost } = require('./proxy-helper')
+const usageTracker = require('./usage-tracker')
 
 // Errors that look like the proxy is dead (TCP-level / DNS / handshake).
 // Anything in this set on a proxied request triggers proxy failover.
@@ -37,8 +38,18 @@ async function resolveAccountProxy(email) {
  * Send chat request
  * Retries up to config.proxyMaxRetries times when the proxy looks dead.
  * Each retry asks the smart pool for a fresh binding.
+ *
+ * Side-effect: usageTracker.recordAccountAttempt is called on each
+ * attempt, recordAccountFailure on per-attempt errors. Stream-level
+ * success / token counts are NOT recorded here — the caller must
+ * attach `usageTracker.attachStreamTracker(response, { apiKey, email })`
+ * once it has the stream, since the upstream stream is consumed by the
+ * caller and we don't want to double-instrument it.
+ *
  * @param {Object} body - Request body
- * @returns {Promise<Object>} Response result
+ * @returns {Promise<{status:boolean,response:Object|null,currentToken?:string,currentEmail?:string}>}
+ *          On success: { status:true, response:stream, currentToken, currentEmail }.
+ *          On failure: { status:false, response:null }.
  */
 const sendChatRequest = async (body) => {
     // Wait for the (lazy, async) account-manager init before doing
@@ -68,6 +79,12 @@ const sendChatRequest = async (body) => {
             logger.error('Cannot get valid access token', 'TOKEN')
             return { status: false, response: null }
         }
+
+        // Bump per-account "totalRequests" counter for this attempt. A
+        // single client request that retries N times will count as N
+        // attempts on the rotated accounts — that's intentional, it
+        // matches "what was actually asked of each upstream account".
+        try { usageTracker.recordAccountAttempt({ email: currentEmail }) } catch { /* never block on stats */ }
 
         const currentProxy = await resolveAccountProxy(currentEmail)
 
@@ -120,13 +137,16 @@ const sendChatRequest = async (body) => {
             if (response.status === 200) {
                 return {
                     currentToken: currentToken,
+                    currentEmail: currentEmail,
                     status: true,
                     response: response.data
                 }
             }
             lastError = new Error(`Request failed with status code ${response.status}`)
+            try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
         } catch (error) {
             lastError = error
+            try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
             logger.error(`Chat request failed (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(currentProxy)}): ${error.message}`, 'REQUEST')
 
             // Only proxy-shaped errors are retryable. Auth errors, 4xx and

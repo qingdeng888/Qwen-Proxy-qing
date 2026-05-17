@@ -125,6 +125,29 @@ export async function deleteApiKey(key) {
   })
 }
 
+/* ----- usage stats ----- */
+
+/**
+ * Fetch the full usage snapshot. Returns the parsed object directly
+ * (not a wrapper), shape: { apiKeys: [...], accounts: [...], summary }.
+ */
+export async function fetchUsage() {
+  return apiFetch(API_ENDPOINTS.USAGE)
+}
+
+/**
+ * Reset usage counters. Scope:
+ *   - 'all'                 → wipe everything
+ *   - 'apikey' + { id }     → reset one bucket by snapshot id
+ *   - 'account' + { email } → reset one account bucket
+ */
+export async function resetUsage(payload) {
+  return apiFetch(API_ENDPOINTS.USAGE_RESET, {
+    method: 'POST',
+    body: JSON.stringify(payload || { scope: 'all' }),
+  })
+}
+
 /* ----- smart proxy pool ----- */
 
 export async function fetchProxies() {
