@@ -12,6 +12,7 @@ export const API_ENDPOINTS = {
   VERCEL_STATUS: '/api/vercel/status',
   VERCEL_ENV: '/api/vercel/env',
   VERCEL_REDEPLOY: '/api/vercel/redeploy',
+  API_KEYS: '/api/apiKeys',
   SERVICE_INFO: '/',
 }
 
