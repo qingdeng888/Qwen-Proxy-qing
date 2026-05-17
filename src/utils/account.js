@@ -698,6 +698,32 @@ class Account {
     getProxyStatus() {
         return this.proxyPool ? this.proxyPool.list() : []
     }
+
+    /**
+     * Add a proxy URL to the smart pool. If the pool isn't constructed
+     * yet (no PROXIES / PROXY_URL env var, no persisted entries) we
+     * lazily create an empty one so the operator can grow the pool from
+     * the admin UI on a fresh deploy.
+     *
+     * Without this lazy path the UI's "Add proxy" form 400s with
+     * "Proxy pool not initialized" on every fresh self-hosted deploy
+     * — chicken-and-egg, since the only way to seed the pool was env
+     * vars.
+     *
+     * Idempotent: returns false when the URL is already in the pool.
+     * @param {string} url
+     * @returns {Promise<boolean>}
+     */
+    async addProxyToPool(url) {
+        if (!this.proxyPool) {
+            // Empty constructor; persisted statuses are written
+            // incrementally by ProxyPool itself as we add. No
+            // initialize() call needed — there's nothing to replay.
+            this.proxyPool = new ProxyPool(this.dataPersistence, [])
+            logger.info('Proxy pool lazily created on first runtime add', 'PROXY')
+        }
+        return await this.proxyPool.addProxy(url)
+    }
 }
 
 const accountManager = new Account()
