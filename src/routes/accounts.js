@@ -36,6 +36,12 @@ router.get('/getAllAccounts', adminKeyVerify, async (req, res) => {
         isValid,
         disabled: !!account.disabled,
         lastLoginError: account.lastLoginError || null,
+        // Per-account proxy mode + the fixed URL (if any). The actual
+        // smart-pool binding for 'smart' accounts is separately visible
+        // via /api/proxy/status (assignedAccounts), so we don't echo it
+        // here to avoid two sources of truth.
+        proxyMode: account.proxyMode || 'smart',
+        fixedProxyUrl: account.fixedProxyUrl || null,
       }
     })
 
@@ -197,6 +203,40 @@ router.post('/disableAccount', adminKeyVerify, async (req, res) => {
 })
 
 /**
+ * POST /setAccountProxy - Configure per-account proxy mode.
+ * Body: { email, mode: 'smart'|'fixed'|'none', proxyUrl?: string }
+ *
+ * Modes:
+ *   - 'smart' (default) — pool's lazy-bound proxy with failover
+ *   - 'fixed' — always use proxyUrl (must be set + parseable)
+ *   - 'none'  — never proxy this account, even if PROXY_URL is set
+ *
+ * When transitioning OUT of 'smart', the existing pool binding is torn
+ * down so the email no longer counts as a smart-pool consumer.
+ */
+router.post('/setAccountProxy', adminKeyVerify, async (req, res) => {
+  try {
+    const { email, mode, proxyUrl } = req.body || {}
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'Missing email' })
+    }
+    if (!['smart', 'fixed', 'none'].includes(mode)) {
+      return res.status(400).json({ error: 'Invalid mode (smart|fixed|none)' })
+    }
+    const result = await accountManager.setAccountProxy(email, mode, proxyUrl || null)
+    if (!result.ok) {
+      // Account-not-found gets 404; validation problems get 400.
+      const status = /not found/i.test(result.error || '') ? 404 : 400
+      return res.status(status).json({ error: result.error || 'Failed' })
+    }
+    res.json({ success: true, email, mode, proxyUrl: mode === 'fixed' ? (proxyUrl || null) : null })
+  } catch (error) {
+    logger.error('Failed to set account proxy', 'PROXY', '', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+/**
  * GET /proxy/status - Smart proxy pool status (admin)
  * Returns the in-memory pool snapshot including each entry's status,
  * the host (credentials are stripped), and which accounts are bound to it.
@@ -236,6 +276,35 @@ router.post('/proxy/add', adminKeyVerify, async (req, res) => {
     res.json({ success: ok, url })
   } catch (error) {
     logger.error('Failed to add proxy', 'PROXY', '', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+/**
+ * POST /proxy/test - Probe a single proxy on demand from the admin UI.
+ * Body: { url, target?: 'qwen'|'generic' }
+ *
+ * `target='qwen'` (default) probes the actual Qwen base URL — that's
+ * what the operator usually wants to know: "can this proxy reach the
+ * destination we'll actually call?". `target='generic'` matches the
+ * cheap probes used by the pool's internal selection.
+ *
+ * Side effect: updates the proxy entry's status (available|failed) and
+ * persists. The admin UI re-reads /proxy/status after to repaint.
+ */
+router.post('/proxy/test', adminKeyVerify, async (req, res) => {
+  try {
+    const { url, target = 'qwen' } = req.body || {}
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'Missing url' })
+    }
+    if (!accountManager.proxyPool) {
+      return res.status(400).json({ error: 'Proxy pool not initialized' })
+    }
+    const result = await accountManager.proxyPool.testProxy(url, { target })
+    res.json({ url, ...result })
+  } catch (error) {
+    logger.error('Failed to test proxy', 'PROXY', '', error)
     res.status(500).json({ error: error.message })
   }
 })

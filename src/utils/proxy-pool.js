@@ -2,7 +2,7 @@
 
 const axios = require('axios')
 const { logger } = require('./logger')
-const { buildAgentForUrl, getProxyHost } = require('./proxy-helper')
+const { buildAgentForUrl, getProxyHost, getChatBaseUrl } = require('./proxy-helper')
 
 /**
  * Smart proxy pool — port of the old branch's ProxyManager
@@ -61,49 +61,87 @@ class ProxyPool {
   }
 
   /**
-   * Probe a proxy by issuing a GET against a generic 204 endpoint. We use
-   * www.gstatic.com/generate_204 and www.cloudflare.com/cdn-cgi/trace as
-   * fallbacks — they're tiny, globally distributed, and don't rate-limit.
-   * Returns true if the request lands successfully through the proxy.
-   * Side effect: writes the result into proxies.get(url).status and
-   * persists.
+   * Probe a proxy through one of two target ladders, recording latency
+   * and updating the cached `entry.status` field. Public surface used
+   * by both internal selection (`assignProxy`) and the admin
+   * `/api/proxy/test` endpoint.
+   *
+   *   target: 'generic' (default) — gstatic /generate_204 then cloudflare /trace.
+   *           Cheap probes that just answer "can the proxy reach the
+   *           internet?". Used during selection to avoid burdening Qwen.
+   *   target: 'qwen'              — Qwen base URL (config.qwenChatProxyUrl).
+   *           Used by the admin "test now" button so the operator sees
+   *           "can this proxy reach the actual destination?". Any HTTP
+   *           response (including 4xx) counts as success: TCP+TLS landed,
+   *           which is the only thing the proxy is responsible for.
+   *
+   * Returns: { ok: boolean, status: 'available'|'failed', latencyMs: number, error?: string }
+   * Side effects (always): writes entry.status, calls _persistStatuses.
    */
-  async _testProxy(url) {
+  async testProxy(url, { target = 'generic' } = {}) {
     const entry = this.proxies.get(url)
-    if (!entry) return false
+    if (!entry) return { ok: false, status: 'failed', latencyMs: 0, error: 'unknown_proxy' }
     const agent = buildAgentForUrl(url)
     if (!agent) {
       entry.status = 'failed'
       await this._persistStatuses()
-      return false
+      return { ok: false, status: 'failed', latencyMs: 0, error: 'invalid_url' }
     }
-    const probes = [
-      { url: 'https://www.gstatic.com/generate_204', expect: [204] },
-      { url: 'https://www.cloudflare.com/cdn-cgi/trace', expect: [200] },
-    ]
+
+    const probes = target === 'qwen'
+      ? [
+          // Any 2xx/3xx/4xx means the proxy successfully tunneled the
+          // request to Qwen. 5xx and network-level errors indicate the
+          // proxy itself failed to deliver. validateStatus accepts the
+          // wide range so we don't false-fail on Qwen's auth challenges.
+          { url: getChatBaseUrl(), expect: 'any_lt_500' },
+        ]
+      : [
+          { url: 'https://www.gstatic.com/generate_204', expect: [204] },
+          { url: 'https://www.cloudflare.com/cdn-cgi/trace', expect: [200] },
+        ]
+
+    let lastError = ''
     for (const probe of probes) {
+      const t0 = Date.now()
       try {
+        const validateStatus = probe.expect === 'any_lt_500'
+          ? (s) => s >= 200 && s < 500
+          : (s) => probe.expect.includes(s)
         const res = await axios.get(probe.url, {
           httpAgent: agent,
           httpsAgent: agent,
           proxy: false,
           timeout: 8000,
-          validateStatus: s => probe.expect.includes(s),
+          validateStatus,
         })
-        if (probe.expect.includes(res.status)) {
+        const latencyMs = Date.now() - t0
+        if (validateStatus(res.status)) {
           entry.status = 'available'
           await this._persistStatuses()
-          logger.info(`Proxy ${getProxyHost(url)} OK`, 'PROXY')
-          return true
+          logger.info(`Proxy ${getProxyHost(url)} OK via ${target} (${latencyMs}ms)`, 'PROXY')
+          return { ok: true, status: 'available', latencyMs }
         }
       } catch (err) {
+        lastError = err.code || err.message || 'unknown_error'
         // try next probe
       }
     }
     entry.status = 'failed'
     await this._persistStatuses()
-    logger.warn(`Proxy ${getProxyHost(url)} failed all probes`, 'PROXY')
-    return false
+    logger.warn(`Proxy ${getProxyHost(url)} failed all ${target} probes (${lastError})`, 'PROXY')
+    return { ok: false, status: 'failed', latencyMs: 0, error: lastError || 'all_probes_failed' }
+  }
+
+  /**
+   * Internal short-circuit alias kept for the assignProxy fast path.
+   * Returns just the boolean — selection logic doesn't care about
+   * latency.
+   * @private
+   */
+  async _testProxy(url) {
+    const result = await this.testProxy(url, { target: 'generic' })
+    return result.ok
   }
 
   /**
@@ -187,6 +225,28 @@ class ProxyPool {
     entry.status = 'failed'
     await this._persistStatuses()
     logger.warn(`Proxy ${getProxyHost(url)} marked failed`, 'PROXY')
+  }
+
+  /**
+   * Tear down the smart-pool binding for an email. Used when the
+   * operator switches the account out of `'smart'` mode (to `'fixed'`
+   * or `'none'`) — the email should no longer count toward the pool's
+   * shared-load accounting, and persistence should forget the binding
+   * so it doesn't reappear on next cold start.
+   *
+   * Idempotent: returns false if the email had no binding.
+   */
+  async removeBinding(email) {
+    const url = this.proxyAssignment.get(email)
+    if (!url) return false
+    const entry = this.proxies.get(url)
+    if (entry) entry.assignedAccounts.delete(email)
+    this.proxyAssignment.delete(email)
+    if (this.dataPersistence && this.dataPersistence.saveProxyBinding) {
+      try { await this.dataPersistence.saveProxyBinding(email, null) } catch { /* logged */ }
+    }
+    logger.info(`Cleared pool binding for ${email}`, 'PROXY')
+    return true
   }
 
   /** @private */

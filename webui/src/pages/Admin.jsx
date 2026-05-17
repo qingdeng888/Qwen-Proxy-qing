@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { fetchAccounts, addAccount, deleteAccount, refreshAccount, refreshAllAccounts, setAccountDisabled, fetchProxies, addProxy, removeProxy, fetchApiKeys, addApiKey, deleteApiKey, fetchUsage, resetUsage } from '../utils/api'
+import { fetchAccounts, addAccount, deleteAccount, refreshAccount, refreshAllAccounts, setAccountDisabled, setAccountProxy, fetchProxies, addProxy, removeProxy, testProxy, fetchApiKeys, addApiKey, deleteApiKey, fetchUsage, resetUsage } from '../utils/api'
 import { useToast } from '../hooks/useToast'
 import AccountCard from '../components/AccountCard'
 import StatsCard from '../components/StatsCard'
@@ -18,6 +18,11 @@ export default function Admin() {
   const [proxiesLoaded, setProxiesLoaded] = useState(false)
   const [newProxyUrl, setNewProxyUrl] = useState('')
   const [proxyBusy, setProxyBusy] = useState(false)
+  // Per-proxy testing state: { [url]: { testing: bool, latencyMs?: number } }
+  // testing flag drives the spinner on the test button; latencyMs is shown
+  // briefly after a successful probe so the operator gets immediate feedback
+  // even before the next proxy-list refresh repaints the status badge.
+  const [proxyTest, setProxyTest] = useState({})
   // API keys state
   const [apiKeys, setApiKeys] = useState([])
   const [apiKeysLoaded, setApiKeysLoaded] = useState(false)
@@ -192,6 +197,27 @@ export default function Admin() {
     }
   }
 
+  const handleTestProxy = async (url) => {
+    setProxyTest(s => ({ ...s, [url]: { testing: true } }))
+    try {
+      const result = await testProxy(url, 'qwen')
+      setProxyTest(s => ({ ...s, [url]: { testing: false, ok: result.ok, latencyMs: result.latencyMs } }))
+      if (result.ok) {
+        toast.success(`代理可用 (${result.latencyMs}ms)`)
+      } else {
+        toast.error(`代理不可用: ${result.error || 'failed'}`)
+      }
+      // Refresh the list so the status badge picks up the new value the
+      // server just persisted. The transient { ok, latencyMs } in
+      // proxyTest stays so the operator sees the latency until they
+      // navigate away.
+      await loadProxies()
+    } catch (err) {
+      setProxyTest(s => ({ ...s, [url]: { testing: false } }))
+      toast.error(err.message)
+    }
+  }
+
   const handleAddSingle = async (e) => {
     e.preventDefault()
     if (!email.trim() || !password.trim()) return
@@ -253,6 +279,23 @@ export default function Admin() {
       await setAccountDisabled(em, disabled)
       toast.success(`${disabled ? '已禁用' : '已启用'} ${em}`)
       loadAccounts()
+    } catch (err) {
+      toast.error(err.message)
+    }
+  }
+
+  const handleSetProxy = async (em, mode, proxyUrl) => {
+    try {
+      await setAccountProxy(em, mode, proxyUrl)
+      const label = mode === 'fixed' ? `固定代理 ${proxyUrl}`
+        : mode === 'none' ? '不走代理'
+        : '智能代理'
+      toast.success(`${em}: ${label}`)
+      // Reload both accounts and proxies — the pool's assignedAccounts
+      // counts shift when an account leaves smart mode, and the new
+      // proxyMode/fixedProxyUrl fields come back via /getAllAccounts.
+      await loadAccounts()
+      await loadProxies()
     } catch (err) {
       toast.error(err.message)
     }
@@ -463,6 +506,8 @@ export default function Admin() {
                   onRefresh={handleRefresh}
                   onDelete={handleDelete}
                   onToggleDisabled={handleToggleDisabled}
+                  onSetProxy={handleSetProxy}
+                  proxies={proxies}
                 />
               </div>
             ))}
@@ -523,6 +568,7 @@ export default function Admin() {
                     : p.status === 'failed'
                     ? 'bg-red-500/10 text-red-400 border border-red-500/20'
                     : 'bg-slate-500/10 text-slate-400 border border-slate-500/20'
+                  const tState = proxyTest[p.url] || {}
                   return (
                     <div key={p.url} className="glass-card p-3 flex items-center gap-3">
                       <div className={`w-2 h-2 rounded-full flex-shrink-0 ${dotClass}`} />
@@ -532,9 +578,32 @@ export default function Admin() {
                       <span className={`px-2 py-0.5 rounded-full text-xs ${statusClass}`}>
                         {statusLabel}
                       </span>
+                      {/* Latency from the most recent test stays until next navigation. */}
+                      {tState.ok && Number.isFinite(tState.latencyMs) && (
+                        <span className="text-xs text-emerald-400 hidden sm:inline">
+                          {tState.latencyMs}ms
+                        </span>
+                      )}
                       <span className="text-xs text-slate-500 hidden sm:inline">
                         {p.assignedAccounts?.length || 0} 账号
                       </span>
+                      <button
+                        onClick={() => handleTestProxy(p.url)}
+                        disabled={tState.testing}
+                        className="p-1.5 rounded text-slate-400 hover:text-accent-glow hover:bg-accent-primary/10 transition-all disabled:opacity-50"
+                        title="测试连通性 (走 Qwen 真实地址)"
+                      >
+                        <svg className={`w-4 h-4 ${tState.testing ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          {tState.testing ? (
+                            <>
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                            </>
+                          ) : (
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                          )}
+                        </svg>
+                      </button>
                       <button
                         onClick={() => handleRemoveProxy(p.url)}
                         className="p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-all"
