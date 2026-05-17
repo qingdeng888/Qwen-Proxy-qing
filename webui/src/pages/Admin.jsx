@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { fetchAccounts, addAccount, deleteAccount, refreshAccount, refreshAllAccounts, setAccountDisabled, fetchProxies, addProxy, removeProxy } from '../utils/api'
+import { fetchAccounts, addAccount, deleteAccount, refreshAccount, refreshAllAccounts, setAccountDisabled, fetchProxies, addProxy, removeProxy, fetchApiKeys, addApiKey, deleteApiKey } from '../utils/api'
 import { useToast } from '../hooks/useToast'
 import AccountCard from '../components/AccountCard'
 import StatsCard from '../components/StatsCard'
@@ -18,6 +18,16 @@ export default function Admin() {
   const [proxiesLoaded, setProxiesLoaded] = useState(false)
   const [newProxyUrl, setNewProxyUrl] = useState('')
   const [proxyBusy, setProxyBusy] = useState(false)
+  // API keys state
+  const [apiKeys, setApiKeys] = useState([])
+  const [apiKeysLoaded, setApiKeysLoaded] = useState(false)
+  const [showAddKey, setShowAddKey] = useState(false)
+  const [newKeyValue, setNewKeyValue] = useState('')
+  const [keyBusy, setKeyBusy] = useState(false)
+  const [revealKeys, setRevealKeys] = useState(false)
+  // The key value just created — surfaced in a one-time banner so the
+  // operator can copy it before it gets masked. Cleared on next add.
+  const [lastCreatedKey, setLastCreatedKey] = useState('')
   const { toast } = useToast()
 
   const loadAccounts = useCallback(async () => {
@@ -34,6 +44,7 @@ export default function Admin() {
   useEffect(() => {
     loadAccounts()
     loadProxies()
+    loadApiKeys()
   }, [loadAccounts])
 
   const loadProxies = useCallback(async () => {
@@ -47,6 +58,77 @@ export default function Admin() {
       setProxiesLoaded(true)
     }
   }, [])
+
+  const loadApiKeys = useCallback(async (reveal = false) => {
+    try {
+      const list = await fetchApiKeys(reveal)
+      setApiKeys(Array.isArray(list) ? list : [])
+    } catch (err) {
+      // Non-admin keys can't see this list; silently degrade.
+      setApiKeys([])
+    } finally {
+      setApiKeysLoaded(true)
+    }
+  }, [])
+
+  const handleToggleReveal = async () => {
+    const next = !revealKeys
+    setRevealKeys(next)
+    await loadApiKeys(next)
+  }
+
+  const handleAddKey = async (e) => {
+    e.preventDefault()
+    setKeyBusy(true)
+    try {
+      const res = await addApiKey(newKeyValue.trim())
+      // Show the freshly minted key once so the operator can copy it
+      // before refresh re-masks it.
+      setLastCreatedKey(res.key || '')
+      toast.success(newKeyValue.trim() ? '已添加 API Key' : '已生成新 API Key')
+      setNewKeyValue('')
+      setShowAddKey(false)
+      await loadApiKeys(revealKeys)
+    } catch (err) {
+      toast.error(err.message)
+    } finally {
+      setKeyBusy(false)
+    }
+  }
+
+  const handleDeleteKey = async (item) => {
+    if (!item.deletable) {
+      toast.error('环境变量管理的 Key 无法在此删除')
+      return
+    }
+    if (!confirm(`确定删除此 API Key？\n${item.keyMasked || item.key}`)) return
+    try {
+      // Server expects the raw key value. If we currently see the masked
+      // form we re-fetch with reveal=1 to get the real one. (This still
+      // requires admin auth on the server side.)
+      let raw = item.key
+      if (!revealKeys) {
+        const list = await fetchApiKeys(true)
+        const match = list.find(k => k.keyMasked === (item.keyMasked || item.key))
+        if (!match) throw new Error('未能定位该 Key')
+        raw = match.key
+      }
+      await deleteApiKey(raw)
+      toast.success('已删除')
+      await loadApiKeys(revealKeys)
+    } catch (err) {
+      toast.error(err.message)
+    }
+  }
+
+  const copyToClipboard = async (value, label = 'Key') => {
+    try {
+      await navigator.clipboard.writeText(value)
+      toast.success(`已复制 ${label}`)
+    } catch {
+      toast.error('复制失败')
+    }
+  }
 
   const handleAddProxy = async (e) => {
     e.preventDefault()
@@ -423,6 +505,176 @@ export default function Admin() {
                         onClick={() => handleRemoveProxy(p.url)}
                         className="p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-all"
                         title="移除"
+                      >
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* API Key 管理 — runtime keys list with reveal toggle, add form,
+            and delete. Env-managed keys (incl. admin) are listed with
+            a lock icon and cannot be deleted from the UI. */}
+        {apiKeysLoaded && (
+          <div className="mt-10 animate-fade-in">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-lg font-display font-semibold text-white">API Key 管理</h2>
+                <p className="text-xs text-slate-500 mt-0.5">控制访问代理服务的 Key；环境变量定义的 Key 只读，运行时新增的 Key 持久化保存</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleToggleReveal}
+                  className="btn-ghost text-xs flex items-center gap-1.5"
+                  title={revealKeys ? '隐藏明文' : '显示明文'}
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    {revealKeys ? (
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+                    ) : (
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                    )}
+                  </svg>
+                  {revealKeys ? '隐藏' : '显示'}
+                </button>
+                <button
+                  onClick={() => setShowAddKey(v => !v)}
+                  className="btn-primary text-xs flex items-center gap-1.5"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                  添加 Key
+                </button>
+              </div>
+            </div>
+
+            {/* One-time banner: shows the freshly minted raw key value
+                so the operator can copy it. Subsequent loads will mask
+                it unless they toggle reveal. */}
+            {lastCreatedKey && (
+              <div className="glass-card p-4 mb-4 border-l-2 border-l-emerald-500/40 animate-slide-up">
+                <div className="flex items-start gap-3">
+                  <svg className="w-5 h-5 text-emerald-400 mt-0.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-semibold text-white mb-1">新 Key 已创建</div>
+                    <p className="text-xs text-slate-400 mb-2">请立刻复制并保存好，关闭后只能看到掩码形式。</p>
+                    <div className="flex items-center gap-2">
+                      <code className="flex-1 px-3 py-2 rounded bg-black/40 text-xs font-mono text-emerald-300 break-all">
+                        {lastCreatedKey}
+                      </code>
+                      <button
+                        onClick={() => copyToClipboard(lastCreatedKey, '新 Key')}
+                        className="btn-ghost text-xs whitespace-nowrap"
+                      >
+                        复制
+                      </button>
+                      <button
+                        onClick={() => setLastCreatedKey('')}
+                        className="text-slate-500 hover:text-slate-300"
+                        title="关闭"
+                      >
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Add form. Empty input -> server auto-generates an sk-... key. */}
+            {showAddKey && (
+              <form onSubmit={handleAddKey} className="glass-card p-4 mb-4 flex items-center gap-2 animate-slide-up">
+                <input
+                  type="text"
+                  value={newKeyValue}
+                  onChange={(e) => setNewKeyValue(e.target.value)}
+                  placeholder="自定义 Key (留空则自动生成 sk-... )"
+                  className="input-field flex-1 text-sm py-2 font-mono"
+                  disabled={keyBusy}
+                  autoFocus
+                />
+                <button
+                  type="submit"
+                  disabled={keyBusy}
+                  className="btn-primary text-sm py-2 px-4 disabled:opacity-50 whitespace-nowrap"
+                >
+                  {keyBusy ? '处理中...' : (newKeyValue.trim() ? '添加' : '生成')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setShowAddKey(false); setNewKeyValue('') }}
+                  className="btn-ghost text-sm py-2 px-3"
+                >
+                  取消
+                </button>
+              </form>
+            )}
+
+            {/* Key list */}
+            {apiKeys.length === 0 ? (
+              <div className="glass-card p-6 text-center text-sm text-slate-500">
+                暂无 API Key。可在 <code className="text-accent-glow font-mono">API_KEY</code> 环境变量中初始化，或点击上方"添加 Key"。
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {apiKeys.map((item, idx) => {
+                  const display = revealKeys ? item.key : (item.keyMasked || item.key)
+                  const sourceLabel = item.source === 'env' ? '环境变量' : '运行时'
+                  const sourceClass = item.source === 'env'
+                    ? 'bg-slate-500/10 text-slate-300 border border-slate-500/20'
+                    : 'bg-accent-primary/10 text-accent-glow border border-accent-primary/20'
+                  return (
+                    <div key={`${item.source}-${item.keyMasked}-${idx}`} className="glass-card p-3 flex items-center gap-3">
+                      {item.isAdmin ? (
+                        <svg className="w-4 h-4 text-amber-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" title="管理员 Key">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4 text-slate-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                        </svg>
+                      )}
+                      <code
+                        className={`text-xs font-mono flex-1 truncate ${revealKeys ? 'text-emerald-300' : 'text-slate-300'}`}
+                        title={display}
+                      >
+                        {display}
+                      </code>
+                      {item.isAdmin && (
+                        <span className="px-2 py-0.5 rounded-full text-xs bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                          管理员
+                        </span>
+                      )}
+                      <span className={`px-2 py-0.5 rounded-full text-xs ${sourceClass}`}>
+                        {sourceLabel}
+                      </span>
+                      {revealKeys && (
+                        <button
+                          onClick={() => copyToClipboard(item.key)}
+                          className="p-1.5 rounded text-slate-400 hover:text-accent-glow hover:bg-white/[0.04] transition-all"
+                          title="复制"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                          </svg>
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleDeleteKey(item)}
+                        disabled={!item.deletable}
+                        className="p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:text-slate-400 disabled:hover:bg-transparent"
+                        title={item.deletable ? '删除' : '环境变量管理的 Key 不可在此删除'}
                       >
                         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />

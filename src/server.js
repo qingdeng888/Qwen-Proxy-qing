@@ -17,6 +17,11 @@ const accountsRouter = require('./routes/accounts.js')
 const vercelRouter = require('./routes/vercel.js')
 const anthropicRouter = require('./routes/anthropic.js')
 const geminiRouter = require('./routes/gemini.js')
+const apiKeysRouter = require('./routes/api-keys.js')
+// Eager-init the api-key manager so its load-from-persistence promise
+// starts running at boot rather than on first request. Each route
+// handler still awaits initPromise defensively.
+require('./utils/api-key-manager')
 
 const app = express()
 
@@ -49,6 +54,7 @@ app.use(chatRouter)
 app.use(verifyRouter)
 app.use('/api', accountsRouter)
 app.use('/api', vercelRouter)
+app.use('/api', apiKeysRouter)
 
 // Serve frontend static files in production
 const path = require('path')

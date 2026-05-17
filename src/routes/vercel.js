@@ -5,7 +5,8 @@ const { adminKeyVerify } = require('../middlewares/authorization')
 const redisClient = require('../utils/redis-client')
 const config = require('../config/index.js')
 const accountManager = require('../utils/account.js')
-const { syncAccountsToVercel, syncProxiesToVercel, syncDisabledAccountsToVercel } = require('../utils/vercel-sync')
+const apiKeyManager = require('../utils/api-key-manager')
+const { syncAccountsToVercel, syncProxiesToVercel, syncDisabledAccountsToVercel, syncApiKeysToVercel } = require('../utils/vercel-sync')
 const { logger } = require('../utils/logger')
 
 function getVercelConfig() {
@@ -184,6 +185,9 @@ router.post('/vercel/syncNow', adminKeyVerify, async (req, res) => {
     if (wants('proxies')) {
       const list = accountManager.proxyPool ? accountManager.proxyPool.list().map(p => p.url) : []
       result.proxies = await syncProxiesToVercel(list)
+    }
+    if (wants('apikeys')) {
+      result.apikeys = await syncApiKeysToVercel(apiKeyManager.getAllKeys())
     }
     res.json({ success: true, result })
   } catch (error) {

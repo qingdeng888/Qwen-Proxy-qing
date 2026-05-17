@@ -370,6 +370,51 @@ class DataPersistence {
     }
     return false
   }
+
+  /* -------------------- api keys persistence -------------------- */
+  // apiKeys persists the list of runtime-managed API keys (excluding the
+  // admin/master key from API_KEY env var, which is always treated as
+  // immutable). Stored as a flat string array.
+
+  async loadApiKeys() {
+    if (config.dataSaveMode === 'file') {
+      try {
+        await this._ensureDataFileExists()
+        const data = JSON.parse(await fs.readFile(this.dataFilePath, 'utf-8'))
+        return Array.isArray(data.apiKeys) ? data.apiKeys : []
+      } catch (error) {
+        logger.error('Failed to load api keys', 'DATA', '', error)
+        return []
+      }
+    }
+    if (config.dataSaveMode === 'redis') {
+      const blob = await this._readRedisBlob()
+      return Array.isArray(blob.apiKeys) ? blob.apiKeys : []
+    }
+    return []
+  }
+
+  async saveApiKeys(keys) {
+    const list = Array.isArray(keys) ? [...new Set(keys.filter(Boolean))] : []
+    if (config.dataSaveMode === 'file') {
+      try {
+        await this._ensureDataFileExists()
+        const data = JSON.parse(await fs.readFile(this.dataFilePath, 'utf-8'))
+        data.apiKeys = list
+        await fs.writeFile(this.dataFilePath, JSON.stringify(data, null, 2), 'utf-8')
+        return true
+      } catch (error) {
+        logger.error('Failed to save api keys', 'DATA', '', error)
+        return false
+      }
+    }
+    if (config.dataSaveMode === 'redis') {
+      const blob = await this._readRedisBlob()
+      blob.apiKeys = list
+      return this._writeRedisBlob(blob)
+    }
+    return false
+  }
 }
 
 module.exports = DataPersistence

@@ -92,6 +92,39 @@ export async function vercelSyncNow(scopes) {
   })
 }
 
+/* ----- api keys (runtime) ----- */
+
+/**
+ * Fetch the runtime API key list. By default the server returns masked
+ * keys; pass `reveal=true` to fetch raw values (used by the operator
+ * UI when they explicitly toggle visibility).
+ */
+export async function fetchApiKeys(reveal = false) {
+  const url = reveal
+    ? `${API_ENDPOINTS.API_KEYS}?reveal=1`
+    : API_ENDPOINTS.API_KEYS
+  const data = await apiFetch(url)
+  return data.data || []
+}
+
+/**
+ * Add a new runtime API key. If `key` is omitted/empty, server
+ * auto-generates one with a `sk-` prefix and returns it.
+ */
+export async function addApiKey(key) {
+  return apiFetch(API_ENDPOINTS.API_KEYS, {
+    method: 'POST',
+    body: JSON.stringify({ key: key || '' }),
+  })
+}
+
+export async function deleteApiKey(key) {
+  return apiFetch(API_ENDPOINTS.API_KEYS, {
+    method: 'DELETE',
+    body: JSON.stringify({ key }),
+  })
+}
+
 /* ----- smart proxy pool ----- */
 
 export async function fetchProxies() {

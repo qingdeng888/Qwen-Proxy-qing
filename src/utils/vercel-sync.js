@@ -168,9 +168,34 @@ async function syncAccountsToVercel(accounts) {
   }
 }
 
+/**
+ * Push the combined API key list to the Vercel project's API_KEY env
+ * var. Comma-separated. Same gating as the other sync helpers — skipped
+ * when redis is the source of truth, or when Vercel sync isn't
+ * configured.
+ *
+ * IMPORTANT: the first key in the list MUST be the admin key (env-side
+ * order). The api-key-manager preserves this in getAllKeys().
+ */
+async function syncApiKeysToVercel(keys) {
+  const gate = shouldSync()
+  if (!gate.ok) return { synced: false, reason: gate.reason }
+  try {
+    const list = [...new Set((keys || []).filter(Boolean))]
+    const value = list.join(',')
+    await _writeEnv('API_KEY', value)
+    logger.success(`Synced API_KEY to Vercel (${list.length} entries)`, 'VERCEL')
+    return { synced: true, count: list.length }
+  } catch (err) {
+    logger.error(`Vercel API_KEY sync failed: ${err.message}`, 'VERCEL')
+    return { synced: false, reason: 'api_error', error: err.message }
+  }
+}
+
 module.exports = {
   syncProxiesToVercel,
   syncDisabledAccountsToVercel,
   syncAccountsToVercel,
+  syncApiKeysToVercel,
   shouldSync,
 }
