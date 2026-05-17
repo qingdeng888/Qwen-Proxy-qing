@@ -3,16 +3,12 @@ const router = express.Router()
 const apiKeyManager = require('../utils/api-key-manager')
 const { adminKeyVerify } = require('../middlewares/authorization')
 const { logger } = require('../utils/logger')
+const { maskApiKey } = require('../utils/tools')
 
-/**
- * Mask a key for display: keep the first 6 and last 4 chars, replace
- * the middle with '****'. Short keys (< 12 chars) are fully masked.
- */
-function maskKey(key) {
-  if (!key) return ''
-  if (key.length <= 12) return '*'.repeat(key.length)
-  return `${key.slice(0, 6)}****${key.slice(-4)}`
-}
+// Local alias to keep call sites short. See utils/tools.js for the
+// masking rules — last 3 chars are always surfaced so operators can
+// disambiguate keys in the admin UI / usage table.
+const maskKey = maskApiKey
 
 /**
  * GET /api/apiKeys
