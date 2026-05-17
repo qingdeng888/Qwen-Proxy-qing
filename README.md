@@ -152,20 +152,69 @@ curl "http://localhost:3000/v1beta/models/qwen3.6-plus:generateContent" \
 
 > 💡 **Vercel 同步是可选的**：它的主要用途是把 `ACCOUNTS` 写回 Vercel env 让重部署后保留。如果你已经用了 `DATA_SAVE_MODE=redis`，账号和代理状态直接持久化在 Redis，通过管理面板（`/admin`）就能增删账号——**不需要再配 Vercel 同步**。Redis 模式更通用，跨平台一致。两种方式二选一。
 
-### Docker 部署
+### Docker 部署（推荐自部署方式）
+
+镜像采用三阶段构建：① 装后端生产依赖 → ② 构建 webui 前端 → ③ 拼装运行时镜像。最终镜像里同时包含后端服务和已构建的管理面板（`webui/dist`），开箱即用。
+
+#### 一键启动（compose）
 
 ```bash
+# 1. 准备环境变量
+cp .env.example .env
+# 编辑 .env，至少填好 API_KEY 和 ACCOUNTS
+
+# 2. 启动
 docker compose up -d
 
-# 或手动
+# 3. 查看日志
+docker compose logs -f
+
+# 4. 访问管理面板
+# 浏览器打开 http://localhost:3000
+# 用 .env 里的 API_KEY 登录
+```
+
+`docker-compose.yml` 默认配置：
+- `DATA_SAVE_MODE=file`，账号 token、代理池状态、运行时 API Key、用量统计全部持久化到 `./data/data.json`
+- `./data` 与 `./logs` 已挂为本机卷，容器重启或镜像重建数据都不丢
+- 透传所有可选环境变量（`PROXIES`、`PROXY_MAX_RETRIES`、`DISABLED_ACCOUNTS`、`OUTPUT_THINK`、`SEARCH_INFO_MODE`、`QWEN_CHAT_PROXY_URL` 等），有就用，没有就走默认值
+- 内置 `/health` 健康检查
+
+#### 数据持久化（JSON 文件，无需 Redis）
+
+`data/data.json` 单文件存储以下五块数据：
+
+| 字段 | 内容 |
+|---|---|
+| `accounts` | 账号列表（含刷新后的 token、过期时间、`disabled` 标记、每账号代理模式） |
+| `proxyBindings` | 账号 ↔ 代理 的绑定关系 |
+| `proxyStatuses` | 每个代理的最新健康状态（untested / available / failed） |
+| `apiKeys` | Web 面板里运行时增删的 API Key（admin key 除外） |
+| `usage` | 每个 API Key / 每个 Qwen 账号的累计请求数、token 用量、最近使用时间 |
+
+> 自部署/Docker 场景下推荐 `DATA_SAVE_MODE=file`，**不需要 Redis**。Redis 模式只对 Vercel / Netlify 这种无持久磁盘的 serverless 平台有意义。
+
+#### 手动 docker run（不用 compose）
+
+```bash
 docker build -t qwen-proxy .
-docker run -d -p 3000:3000 \
+docker run -d --name qwen2api \
+  -p 3000:3000 \
   -e API_KEY=sk-your-key \
   -e ACCOUNTS=email:password \
+  -e DATA_SAVE_MODE=file \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/logs:/app/logs \
   qwen-proxy
 ```
 
-需要持久化存储时加 `-e DATA_SAVE_MODE=file -v ./data:/app/data`。
+#### 升级
+
+```bash
+git pull
+docker compose build --no-cache   # 强制重新构建前端
+docker compose up -d
+```
 
 仓库已配置 GitHub Actions 自动构建并发布镜像到 GHCR / Release，详见 [.github/workflows](.github/workflows/)。
 
