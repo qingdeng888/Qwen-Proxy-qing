@@ -74,10 +74,14 @@ const handleAnthropicMessages = async (req, res) => {
     }
 
     // Passive token-count sniffer + success/failure finalizer.
+    // promptMessages is the OpenAI-format messages we converted from
+    // the original Anthropic body — used by the tracker for prompt
+    // token estimation when upstream omits the usage field.
     try {
       usageTracker.attachStreamTracker(response_data.response, {
         apiKey: req.apiKey,
         email: response_data.currentEmail,
+        promptMessages: req.body && req.body.messages,
       })
     } catch { /* swallow */ }
 
