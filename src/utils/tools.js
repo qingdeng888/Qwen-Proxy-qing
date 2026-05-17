@@ -43,10 +43,33 @@ const generateUUID = () => {
   return crypto.randomUUID()
 }
 
+/**
+ * Mask an API key for display.
+ *
+ * Always surfaces the last 3 characters so operators can tell distinct
+ * keys apart in the usage table — the previous all-asterisks form for
+ * short keys made same-length keys visually identical.
+ *
+ *   len ≤ 4   → fully masked (too short to safely show)
+ *   5..10     → asterisks + last 3       e.g. 'sk-test' → '****est'
+ *   ≥ 11      → first 4 + **** + last 4  e.g. 'sk-1234567890abcdef' → 'sk-1****cdef'
+ *
+ * @param {string} key
+ * @returns {string}
+ */
+const maskApiKey = (key) => {
+  if (!key) return ''
+  const len = key.length
+  if (len <= 4) return '*'.repeat(len)
+  if (len <= 10) return '*'.repeat(len - 3) + key.slice(-3)
+  return `${key.slice(0, 4)}****${key.slice(-4)}`
+}
+
 module.exports = {
   isJson,
   sleep,
   sha256Encrypt,
   JwtDecode,
-  generateUUID
+  generateUUID,
+  maskApiKey,
 }

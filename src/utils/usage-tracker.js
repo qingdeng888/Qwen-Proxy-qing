@@ -39,6 +39,7 @@ const crypto = require('crypto')
 const DataPersistence = require('./data-persistence')
 const { logger } = require('./logger')
 const { createUsageObject } = require('./precise-tokenizer')
+const { maskApiKey } = require('./tools')
 
 const FLUSH_INTERVAL_MS = 30 * 1000
 const ANON_ID = '(anonymous)'
@@ -158,7 +159,7 @@ class UsageTracker {
     const id = hashKey(norm)
     if (!this.apiKeyMeta[id]) {
       this.apiKeyMeta[id] = {
-        keyMasked: norm.length <= 12 ? '*'.repeat(norm.length) : `${norm.slice(0, 6)}****${norm.slice(-4)}`,
+        keyMasked: maskApiKey(norm),
         raw: norm,
       }
     }
@@ -412,7 +413,7 @@ class UsageTracker {
     for (const item of knownKeys) {
       if (!item || !item.key) continue
       idToLabel[hashKey(item.key)] = {
-        keyMasked: item.keyMasked || (item.key.length <= 12 ? '*'.repeat(item.key.length) : `${item.key.slice(0, 6)}****${item.key.slice(-4)}`),
+        keyMasked: item.keyMasked || maskApiKey(item.key),
         source: item.source,
         isAdmin: !!item.isAdmin,
       }
