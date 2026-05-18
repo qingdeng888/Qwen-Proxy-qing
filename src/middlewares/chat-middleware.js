@@ -16,10 +16,20 @@ const {
  *
  * - assistant.tool_calls → DSML <|DSML|tool_calls> appended to content
  * - role:'tool'         → role:'user' with a <|DSML|tool_result> block
- * - prepended system message holds the tool schemas + format instructions
+ *
+ * NOTE: The tool prompt block (schemas + format rules) is intentionally NOT
+ * prepended here as a head `system` message. It is passed separately to
+ * `parserMessages`, which places it right before the current user question
+ * inside the flattened conversation. The previous head-injection approach
+ * silently broke tool calling once histories grew long: stateless clients
+ * like Hermes replay the entire conversation on every turn, so after some
+ * idle / back-and-forth the rules were buried far from the latest question
+ * and the model fell back to plain prose. Keeping the rules adjacent to
+ * the live ask keeps them in the model's attention window regardless of
+ * history length.
  */
-function injectToolCallContext(messages, tools) {
-  const rewritten = (messages || []).map((m) => {
+function rewriteToolCallHistory(messages) {
+  return (messages || []).map((m) => {
     if (!m || typeof m !== 'object') return m
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
       const dsml = serializeAssistantToolCalls(m.tool_calls)
@@ -34,8 +44,6 @@ function injectToolCallContext(messages, tools) {
     }
     return m
   })
-  const promptBlock = buildToolPromptBlock(tools)
-  return [{ role: 'system', content: promptBlock }, ...rewritten]
 }
 
 /**
@@ -93,14 +101,16 @@ const processRequestBody = async (req, res, next) => {
     // Tool-call gate: only activate when the client actually sent `tools`.
     // When inactive, behavior is byte-identical to before this feature existed.
     req.toolcall_enabled = false
+    let toolPromptBlock = null
     if (hasTools(req.body)) {
       req.toolcall_enabled = true
       req.toolcall_tools = req.body.tools
-      messages = injectToolCallContext(messages, req.body.tools)
+      messages = rewriteToolCallHistory(messages)
+      toolPromptBlock = buildToolPromptBlock(req.body.tools)
     }
 
     // Process messages
-    body.messages = await parserMessages(messages, isThinkingEnabled(model, enable_thinking, thinking_budget, reasoning_effort), body.chat_type)
+    body.messages = await parserMessages(messages, isThinkingEnabled(model, enable_thinking, thinking_budget, reasoning_effort), body.chat_type, toolPromptBlock)
 
     // Process enable_thinking
     req.enable_thinking = isThinkingEnabled(model, enable_thinking, thinking_budget, reasoning_effort).thinking_enabled
