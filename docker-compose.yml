@@ -17,10 +17,15 @@ services:
       - ACCOUNTS=${ACCOUNTS}
 
       # ── Persistence (JSON file) ──────────────────────────────
-      # `file` writes accounts / proxy bindings / proxy statuses /
-      # API keys / usage stats to /app/data/data.json. The volume
-      # below makes that survive container restarts.
-      - DATA_SAVE_MODE=${DATA_SAVE_MODE:-file}
+      # Hard-coded to `file` for Docker — accounts / proxy bindings /
+      # proxy statuses / API keys / usage stats all write to
+      # /app/data/data.json, persisted via the ./data volume below.
+      #
+      # Deliberately NOT interpolated from the host env: a stray
+      # `DATA_SAVE_MODE=none` in .env (e.g. copied from .env.example)
+      # would silently disable persistence and the ./data dir would
+      # stay empty. If you really want redis or none, edit this line.
+      - DATA_SAVE_MODE=file
 
       # ── Logging ──────────────────────────────────────────────
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
