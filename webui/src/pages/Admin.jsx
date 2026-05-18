@@ -270,8 +270,20 @@ export default function Admin() {
   const handleRefreshAll = async () => {
     setRefreshingAll(true)
     try {
-      await refreshAllAccounts()
-      toast.success('已刷新全部账号')
+      // Server defaults to force=true so every account is re-logged in,
+      // not just ones whose tokens were going to expire within 24h
+      // (which silently no-op'd on healthy tokens — looked broken).
+      const result = await refreshAllAccounts()
+      const refreshed = Number(result?.refreshed ?? result?.refreshedCount ?? 0)
+      const total = Number(result?.total ?? refreshed)
+      const failed = Number(result?.failed ?? Math.max(0, total - refreshed))
+      if (total === 0) {
+        toast.info?.('没有需要刷新的账号') || toast.success('没有需要刷新的账号')
+      } else if (failed === 0) {
+        toast.success(`已刷新 ${refreshed} 个账号`)
+      } else {
+        toast.error(`刷新完成：${refreshed} 个成功，${failed} 个失败（详见服务端日志）`)
+      }
       loadAccounts()
     } catch (err) {
       toast.error(err.message)

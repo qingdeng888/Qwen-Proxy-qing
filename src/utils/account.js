@@ -222,28 +222,48 @@ class Account {
     }
 
     /**
-     * Auto-refresh expiring tokens
-     * @param {number} thresholdHours - Expiry threshold (hours)
-     * @returns {Promise<number>} Number of successfully refreshed tokens
+     * Refresh account tokens.
+     *
+     * Two callers, two intents:
+     *   - The internal 6h timer wants to be cheap: only re-login the
+     *     accounts whose tokens will expire within `thresholdHours`.
+     *     Default 24h. Avoids hammering the upstream signin endpoint
+     *     when most tokens are still healthy.
+     *   - The "Refresh all" button in the admin UI wants every account
+     *     re-logged in, regardless of remaining validity. Operators
+     *     hit it specifically to force a known-good state — silently
+     *     no-oping because tokens "still have 200h left" was confusing
+     *     and looked like a broken button.
+     *
+     * `force=true` skips the threshold filter and refreshes every
+     * account that has both email + password. Disabled accounts are
+     * still skipped to honor the operator's intent.
+     *
+     * @param {number}  thresholdHours - Expiry threshold (hours), ignored when force=true
+     * @param {boolean} force          - Refresh all accounts regardless of expiry
+     * @returns {Promise<{refreshed:number, total:number}>}
      */
-    async autoRefreshTokens(thresholdHours = 24) {
+    async autoRefreshTokens(thresholdHours = 24, force = false) {
         if (!this.isInitialized) {
             logger.warn('Account manager not yet initialized, skipping auto-refresh', 'TOKEN')
-            return 0
+            return { refreshed: 0, total: 0 }
         }
 
-        logger.info('Starting auto token refresh...', 'TOKEN')
+        logger.info(`Starting token refresh (force=${force}, threshold=${thresholdHours}h)...`, 'TOKEN')
 
-        const needsRefresh = this.accountTokens.filter(account =>
-            this.tokenManager.isTokenExpiringSoon(account.token, thresholdHours)
-        )
+        const candidates = this.accountTokens.filter(a => a.email && a.password && !a.disabled)
+        const needsRefresh = force
+            ? candidates
+            : candidates.filter(account =>
+                this.tokenManager.isTokenExpiringSoon(account.token, thresholdHours)
+            )
 
         if (needsRefresh.length === 0) {
             logger.info('No tokens need refreshing', 'TOKEN')
-            return 0
+            return { refreshed: 0, total: 0 }
         }
 
-        logger.info(`Found ${needsRefresh.length} tokens needing refresh`, 'TOKEN')
+        logger.info(`Refreshing ${needsRefresh.length} account(s)`, 'TOKEN')
 
         let successCount = 0
 
@@ -276,8 +296,8 @@ class Account {
         }
 
         this.accountRotator.setAccounts(this.accountTokens)
-        logger.success(`Token refresh complete: ${successCount} succeeded`, 'TOKEN')
-        return successCount
+        logger.success(`Token refresh complete: ${successCount}/${needsRefresh.length} succeeded`, 'TOKEN')
+        return { refreshed: successCount, total: needsRefresh.length }
     }
 
     /**
