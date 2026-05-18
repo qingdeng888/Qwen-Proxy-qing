@@ -301,16 +301,23 @@ const formatHistoryMessages = (messages) => {
  * @param {Array} messages - Original message array
  * @param {object} thinking_config - Thinking config
  * @param {string} chat_type - Chat type
+ * @param {string} [toolPromptBlock] - Optional tool-call prompt block (schemas
+ *   + format rules). When provided, it is placed RIGHT BEFORE the current
+ *   user question (not at the head of history) so the rules stay close to
+ *   the live ask in the model's attention window. This matters because
+ *   stateless clients like Hermes replay the full conversation each turn:
+ *   if rules sit at the front of a long history, the model often forgets
+ *   the DSML format and tool calls silently degrade into plain prose.
  * @returns {Promise<Array>} Parsed message array
  */
-const parserMessages = async (messages, thinking_config, chat_type) => {
+const parserMessages = async (messages, thinking_config, chat_type, toolPromptBlock) => {
     try {
         const feature_config = thinking_config
         const imgCacheManager = new CacheManager()
 
         if (messages.length <= 1) {
             logger.network('Single message, using original format', 'PARSER')
-            return await processOriginalLogic(messages, thinking_config, chat_type, imgCacheManager)
+            return await processOriginalLogic(messages, thinking_config, chat_type, imgCacheManager, toolPromptBlock)
         }
 
         logger.network('Multiple messages, formatting with role annotations', 'PARSER')
@@ -341,6 +348,11 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
         let combinedText = ''
         if (historyText) {
             combinedText = historyText + ';'
+        }
+        // Inject the tool prompt block right before the current user question
+        // (not at the start of history). See parserMessages JSDoc for why.
+        if (toolPromptBlock) {
+            combinedText += `system:${toolPromptBlock}\n`
         }
         if (lastMessageText.trim()) {
             combinedText += `${lastMessageRole}:${lastMessageText}`
@@ -401,10 +413,37 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
  * @param {object} thinking_config - Thinking config
  * @param {string} chat_type - Chat type
  * @param {object} imgCacheManager - Image cache manager
+ * @param {string} [toolPromptBlock] - Optional tool-call prompt block. When
+ *   provided, it's prepended to the lone message's text content so the
+ *   rules sit immediately before the user question rather than as a
+ *   standalone system message that the upstream collapses anyway.
  * @returns {Promise<Array>} Processed message array
  */
-const processOriginalLogic = async (messages, thinking_config, chat_type, imgCacheManager) => {
+const processOriginalLogic = async (messages, thinking_config, chat_type, imgCacheManager, toolPromptBlock) => {
     const feature_config = thinking_config
+
+    // Inject the tool prompt block adjacent to the only user/assistant
+    // message present, so the format rules are always near the live ask.
+    if (toolPromptBlock && messages.length > 0) {
+        const target = messages[messages.length - 1]
+        if (target && (target.role === 'user' || target.role === 'assistant' || target.role === 'system')) {
+            const prefix = `system:${toolPromptBlock}\n`
+            if (typeof target.content === 'string') {
+                target.content = prefix + target.content
+            } else if (Array.isArray(target.content)) {
+                // Find first text item; if none, prepend a synthetic one.
+                const firstTextIdx = target.content.findIndex(it => it && it.type === 'text')
+                if (firstTextIdx >= 0) {
+                    const it = target.content[firstTextIdx]
+                    target.content[firstTextIdx] = { ...it, text: prefix + (it.text || '') }
+                } else {
+                    target.content.unshift({ type: 'text', text: prefix })
+                }
+            } else {
+                target.content = prefix
+            }
+        }
+    }
 
     for (let message of messages) {
         if (message.role === 'user' || message.role === 'assistant') {
