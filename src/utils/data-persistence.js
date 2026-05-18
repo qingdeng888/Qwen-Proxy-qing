@@ -31,6 +31,14 @@ class DataPersistence {
     if (config.dataSaveMode === 'redis' && !redisClient.isConfigured()) {
       logger.warn('DATA_SAVE_MODE=redis but no Redis credentials found (set REDIS_URL+REDIS_TOKEN, or KV_REST_API_*, or UPSTASH_REDIS_REST_*) — falling back to in-memory.', 'DATA')
     }
+    // Loud warning for the most common self-host misconfig: running on
+    // a long-lived host (Docker / VPS / bare metal) with a /app/data
+    // volume mounted, but DATA_SAVE_MODE left at the env-default
+    // "none". Every saveAccount/saveProxy/etc returns false silently
+    // and the operator wonders why data.json is empty after restart.
+    if (config.dataSaveMode === 'none' && !config.isServerless) {
+      logger.warn('DATA_SAVE_MODE=none on a non-serverless host — accounts, proxies, runtime API keys, and usage stats will all reset on restart. Set DATA_SAVE_MODE=file (and mount a volume for ./data) to persist them.', 'DATA')
+    }
   }
 
   /**
