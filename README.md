@@ -440,6 +440,231 @@ Node.js 18+，先 `npm run build:webui` 再 `npm start` 即可。
 
 ---
 
+## 反向代理：宝塔 Nginx + Cloudflare
+
+适用场景：你已经用 Docker 把服务跑在 VPS 的 `127.0.0.1:3000`，想用自己的域名（比如 `qwen.example.com`）暴露 API，并加上 Cloudflare 的 CDN/防护。
+
+整体链路：
+
+```
+客户端
+  ↓  HTTPS（Cloudflare 边缘节点签的证书）
+Cloudflare CDN（橙云开启，可选 WAF / 限流 / Bot 防护）
+  ↓  HTTPS（源站证书）
+你的 VPS:443
+  ↓  宝塔 Nginx 反向代理 + 流式优化
+Docker 容器 127.0.0.1:3000  ←  本仓库 qwen-proxy
+```
+
+下面按部就班来。
+
+### 步骤 1 — 容器只监听 127.0.0.1（强烈推荐）
+
+公网直接放出 `3000` 是没必要的：所有流量都从 Nginx 进，容器只服务本机就行。改 `docker-compose.yml`：
+
+```yaml
+services:
+  qwen2api:
+    # ...
+    ports:
+      - "127.0.0.1:3000:3000"   # ← 只绑回环网卡，公网扫描不到
+```
+
+`docker compose up -d` 重启。验证：
+
+```bash
+curl -s http://127.0.0.1:3000/health   # → {"status":"ok"}
+curl -s http://<服务器公网IP>:3000/health   # 应该连不上（拒绝 / 超时）
+```
+
+如果还想保留 `:3000` 公网可访问（不推荐），跳过这一步。
+
+### 步骤 2 — Cloudflare 把域名指到你的 VPS
+
+1. Cloudflare dashboard → 选你的域名 → **DNS → Records → Add record**
+2. 加一条：
+   - Type: `A`
+   - Name: `qwen`（最终域名 `qwen.example.com`）
+   - IPv4 address: 你的 VPS 公网 IP
+   - Proxy status: **Proxied（橙色云朵开启）** ← 必开，才能用 Cloudflare 的 CDN/SSL
+3. **SSL/TLS → Overview**，加密模式选 **Full (strict)**
+   - `Off` / `Flexible` 不要选：前者明文，后者 Cloudflare → 你 VPS 是 HTTP，不安全
+   - `Full` 也行但不强制证书有效，懒人可用；规范做法是 `Full (strict)` + 源站证书
+
+### 步骤 3 — 申请源站证书（二选一）
+
+#### 方式 A：Cloudflare Origin Certificate（推荐，15 年有效）
+
+1. Cloudflare dashboard → **SSL/TLS → Origin Server → Create Certificate**
+2. 默认参数（RSA 2048，包含 `*.example.com` 和 `example.com`），Validity 选 15 年
+3. 生成后会给你两块文本：**Origin Certificate**（证书）和 **Private Key**（私钥）
+4. 在 VPS 上保存好（路径用宝塔默认的）：
+
+```bash
+mkdir -p /www/server/panel/vhost/cert/qwen.example.com
+nano /www/server/panel/vhost/cert/qwen.example.com/fullchain.pem   # 粘贴 Origin Certificate
+nano /www/server/panel/vhost/cert/qwen.example.com/privkey.pem     # 粘贴 Private Key
+chmod 600 /www/server/panel/vhost/cert/qwen.example.com/privkey.pem
+```
+
+> 💡 Cloudflare Origin Certificate **只对 Cloudflare 边缘节点信任**，浏览器直接访问你 VPS 公网 IP 会报证书错误——这正好是想要的，强制流量走 Cloudflare。
+
+#### 方式 B：Let's Encrypt（如果不想信任 Cloudflare 私 CA）
+
+宝塔面板里 **网站 → SSL → Let's Encrypt** 一键申请，需要先在 Cloudflare 把 Proxy status 临时改成 **DNS only**（灰云），签完再改回橙云。
+
+### 步骤 4 — 宝塔创建站点 + 配置反代
+
+1. 宝塔面板 → **网站 → 添加站点**
+   - 域名：`qwen.example.com`
+   - PHP 版本：纯静态（**不需要 PHP**，避免装无关组件）
+   - 创建数据库：不勾
+   - 创建 FTP：不勾
+2. 创建后 → **设置 → SSL → 其他证书** → 把上面 fullchain.pem / privkey.pem 内容粘进去 → 保存 → **强制 HTTPS** 开启
+3. **设置 → 反向代理 → 添加反向代理**：
+   - 名称：`qwen-proxy`
+   - 目标 URL：`http://127.0.0.1:3000`
+   - 发送域名：`$host`
+   - 创建
+
+### 步骤 5 — 替换宝塔默认 Nginx 配置（关键）
+
+宝塔自动生成的反代配置**不适合 SSE 流式**，必须手动覆盖。**网站 → 设置 → 配置文件**，把整段替换成：
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name qwen.example.com;
+
+    # SSL（路径就是步骤 3 写进去的）
+    ssl_certificate    /www/server/panel/vhost/cert/qwen.example.com/fullchain.pem;
+    ssl_certificate_key /www/server/panel/vhost/cert/qwen.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # 上传 / 请求体限制 —— 图片编辑、视频生成是 multipart 上传，留宽点
+    client_max_body_size 64m;
+    client_body_buffer_size 256k;
+
+    # 把 Cloudflare 报的真实客户端 IP 透传给后端日志
+    # 完整 CF IP 段见 https://www.cloudflare.com/ips/，这里是常用 v4 段
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 104.16.0.0/13;
+    set_real_ip_from 104.24.0.0/14;
+    set_real_ip_from 172.64.0.0/13;
+    set_real_ip_from 131.0.72.0/22;
+    real_ip_header CF-Connecting-IP;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+
+        # 转发头
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        # ── SSE / 流式输出关键配置 ──────────────────────────────
+        # 必须关掉 nginx 的输出缓冲，否则 stream:true 的回复会卡到结束才一次性返回
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection "";        # 切到 keep-alive
+        proxy_http_version 1.1;
+        # 显式禁用按响应头的缓冲（Anthropic / Gemini 路径也吃这个）
+        proxy_set_header X-Accel-Buffering no;
+
+        # 长流式响应可能跑几分钟（思维链 + 长输出），把超时调大
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    600s;
+        proxy_read_timeout    600s;
+        send_timeout          600s;
+
+        # WebSocket 暂时用不到（项目没用 ws），但留着兼容未来
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $http_connection;
+    }
+}
+
+# 把 :80 redirect 到 :443
+server {
+    listen 80;
+    server_name qwen.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+保存 → 宝塔会自动 `nginx -t` 校验 + reload。如果报错把错误贴回来排查。
+
+### 步骤 6 — 验证
+
+```bash
+# 健康检查（普通 HTTP）
+curl https://qwen.example.com/health
+# → {"status":"ok"}
+
+# 走 OpenAI 协议的非流式调用
+curl https://qwen.example.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-plus","messages":[{"role":"user","content":"你好"}]}'
+
+# 流式调用（关键：观察是不是逐 chunk 出来，不是一次性 dump）
+curl -N https://qwen.example.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-plus","messages":[{"role":"user","content":"写一段长文"}],"stream":true}'
+```
+
+`-N` 是禁用 curl 的输出缓冲；理想情况是看到 `data: {...}` 一条条往下滚，**不是**等几十秒一次性出现。如果是后者，回去检查 `proxy_buffering off` 和 `X-Accel-Buffering no` 这两行有没有写。
+
+### 步骤 7（可选）— Cloudflare 加固
+
+进 Cloudflare dashboard：
+
+| 位置 | 设置 | 说明 |
+|---|---|---|
+| **SSL/TLS → Edge Certificates** | Always Use HTTPS = **On** | 浏览器误打 http 也强制升级 |
+| **SSL/TLS → Edge Certificates** | Min TLS Version = **1.2** | TLS 1.0/1.1 现在没人用了 |
+| **Speed → Optimization → Content** | Brotli = **On** | 文本响应自动压缩 |
+| **Network** | gRPC = **On** | 不用也建议开，未来扩展兼容 |
+| **Network** | HTTP/2 / HTTP/3 = **On** | 默认就开，确认一下 |
+| **Network** | WebSockets = **On** | 默认就开 |
+| **Caching → Configuration** | Browser Cache TTL = **Respect Existing Headers** | 别让 CF 缓存 API 响应 |
+| **Rules → Page Rules** 或 **Configuration Rules** | URL `qwen.example.com/*` → Cache Level = **Bypass** | **关键**，否则同一个请求可能拿到旧响应 |
+| **Security → WAF** | 加自定义规则限流 | 比如 `(http.host eq "qwen.example.com")` 上加 rate-limit |
+
+> ⚠️ **必须 Bypass 缓存**：Cloudflare 默认会试图缓存 GET 响应，本项目 `/v1/models` 之类的端点会被缓存住，新加的账号 / 模型动态加载会看不到变化。规则建一条 `qwen.example.com/*` → Cache Level = Bypass 就行。
+
+### 排错
+
+| 症状 | 可能原因 |
+|---|---|
+| `502 Bad Gateway` | 容器没起 / 没绑 127.0.0.1:3000；`docker compose ps` + `curl 127.0.0.1:3000/health` 自检 |
+| `526 Invalid SSL Certificate` | Cloudflare 设了 Full (strict) 但源站证书不合法。换成 Cloudflare Origin Certificate 或 LE |
+| 流式响应卡几十秒一次性返回 | `proxy_buffering off` 没写 / 没 reload；nginx 配置里漏了 `X-Accel-Buffering no` |
+| 大文件 / 图片编辑 413 报错 | `client_max_body_size` 太小，调到 `64m` 或更大 |
+| 跑久了客户端断 (`upstream timed out`) | `proxy_read_timeout` 太短，拉到 `600s` 或以上 |
+| 后端日志看到的全是 Cloudflare IP | 没配 `set_real_ip_from` + `real_ip_header CF-Connecting-IP` |
+| Cloudflare 一直返回 `Error 1016` | DNS A 记录指错 IP / 该域名被降级到 DNS only 但配置没改回 |
+
+完成后客户端就用 `https://qwen.example.com/v1/chat/completions` 当 base URL，所有 OpenAI / Anthropic / Gemini SDK 都正常工作。
+
+---
+
 ## 贡献
 
 - 提交代码 / PR：见 [docs/contributing.md](docs/contributing.md)
