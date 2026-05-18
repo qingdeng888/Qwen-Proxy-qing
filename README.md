@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>通义千问 OpenAI / Anthropic / Gemini 三协议兼容代理</strong><br>
-  支持 Vercel / Docker / Render 一键部署，零持久化存储
+  支持 Vercel / Docker / Northflank / Render 一键部署，零持久化存储
 </p>
 
 <p align="center">
@@ -39,6 +39,7 @@
 | **代理支持** | HTTP / HTTPS / SOCKS5 代理 |
 | **Vercel 部署** | 部署即同时构建前端 + Serverless 后端 |
 | **Docker 部署** | 多阶段 Alpine 镜像构建 |
+| **Northflank 部署** | 一键 GitHub + 持久卷，长期运行容器，免自建 VPS |
 | **管理面板** | React 暗色主题面板 + 内置聊天（支持版本化重试） + 交互式 API 文档 |
 
 ---
@@ -218,6 +219,131 @@ docker compose up -d
 
 仓库已配置 GitHub Actions 自动构建并发布镜像到 GHCR / Release，详见 [.github/workflows](.github/workflows/)。
 
+### Northflank 部署（推荐：白嫖友好 + 长期运行 + 持久卷）
+
+Northflank 是一个支持原生 Docker 构建 + 持久卷的 PaaS，注册即送试用额度，**适合需要长期运行 + 数据持久化但又不想自己买 VPS 的场景**。和 Vercel/Netlify 不同，它跑的是真正的容器（不是 serverless 冷启动），所以可以直接用本仓库默认的 `DATA_SAVE_MODE=file` + `data.json`，不需要额外配 Redis。
+
+#### 前置准备
+
+- [northflank.com](https://northflank.com) 注册账号并完成邮箱验证
+- 把本仓库 fork 到你的 GitHub（如果还没 fork）
+- 在 Northflank 顶栏 **Account → Connected accounts** 里把你的 GitHub 授权给 Northflank（首次部署会引导你做）
+
+#### 步骤 1 — 创建 Project
+
+进入 Northflank dashboard → 左上角 **Create new** → **Project** →
+- Name: `qwen-proxy`（或任意）
+- Region: 选最靠近你客户端的（亚太用户推荐 `asia-southeast1` / `asia-northeast1`）
+- 创建
+
+#### 步骤 2 — 创建 Combined Service（一键拉 GitHub + 构建 + 部署）
+
+进 Project → **Create new** → **Service** → **Combined service**（同一服务里同时管构建和运行，最省事）。
+
+**Source（代码源）：**
+- 选 **Repository**
+- Account: 你的 GitHub
+- Repository: 选你 fork 后的 `Qwen-Proxy`
+- Branch: `main`（或你部署用的分支）
+- Build context: `/`（仓库根目录）
+
+**Build（构建）：**
+- Build type: **Dockerfile**
+- Dockerfile path: `./Dockerfile`（仓库自带，三阶段构建，会自动构建 webui）
+- 不需要额外 build args
+
+**Deployment（部署）：**
+- Resources: 选 **nf-compute-20**（512 MB 内存）就够用；如果你账号多 / 并发高可以选 nf-compute-50
+- Instances: `1`（默认）
+
+**Networking（端口）：**
+- Add port `3000`，protocol **HTTP**，**勾选 "Publicly expose this port to the internet"**
+- Northflank 会自动给你一个 `https://<service>--<project>--<team>.code.run` 的 HTTPS 域名
+
+**Environment（环境变量）：**
+
+```
+API_KEY            = sk-your-api-key-here
+ACCOUNTS           = email@example.com:password
+SERVICE_PORT       = 3000
+DATA_SAVE_MODE     = file
+LOG_LEVEL          = INFO
+```
+
+可选（按需添加，参考下文 [环境变量](#环境变量)）：
+
+```
+PROXIES            = socks5://...        # 智能代理池
+PROXY_MAX_RETRIES  = 3
+DISABLED_ACCOUNTS  =                     # 启动时禁用的账号
+QWEN_CHAT_PROXY_URL= https://chat.qwen.ai
+```
+
+> 💡 **不要设 `LISTEN_ADDRESS`**，Northflank 默认会绑到 `0.0.0.0`，自己设可能反而绑错。
+
+**Advanced → Persistent volume（持久卷，⚠ 关键步骤）：**
+
+- 点 **Add persistent volume**
+- Container mount path: `/app/data`
+- Storage size: `1 GB`（够用很久；后续可扩容）
+- 创建
+
+> ⚠ **不挂卷的话**，每次 redeploy / 重启容器，`data.json`（账号 token、代理状态、运行时 API Key、用量统计）全部清空。Northflank 默认容器是 ephemeral 的，必须手动加 volume 才能持久化。
+
+可选第二个卷 `/app/logs`（仅当 `ENABLE_FILE_LOG=true` 时需要）。
+
+**Health check（健康检查）：**
+
+- Type: HTTP
+- Path: `/health`
+- Port: `3000`
+
+点 **Create service**，Northflank 会拉代码 → 跑 Dockerfile 三阶段构建（约 2-4 分钟） → 启动容器 → 健康检查通过后亮绿灯。
+
+#### 步骤 3 — 验证
+
+服务亮绿后：
+- 浏览器打开 Networking 页面给的 HTTPS 域名 → 应该看到管理面板
+- 用 `API_KEY` 登录 → 进 **管理** 页面应该能看到从 `ACCOUNTS` env 加载的账号
+- 跑一次请求：
+
+```bash
+curl https://<your-domain>.code.run/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-plus","messages":[{"role":"user","content":"你好"}]}'
+```
+
+#### 步骤 4 — 验证持久化（关键）
+
+这是 Northflank 部署最容易踩坑的环节，务必验证一次：
+
+1. 在管理面板新增一个测试账号，或在用量页面让计数器 +1
+2. 顶栏 **Service → Restart**（强制重启容器）
+3. 重启完成后刷新管理面板 → 数据**应该还在**
+
+如果数据丢了，去 **Service → Volumes** 检查：
+- Container mount path 必须是 `/app/data`
+- Status 必须是 `Mounted`
+- 重新走一次步骤 2 把 volume 加正确
+
+#### 步骤 5（可选）— 自动重新部署
+
+进 Service → **Settings → Continuous deployment** → 勾选 **Auto-deploy on push**。之后你每次 `git push` 到部署分支，Northflank 会自动重新构建 + 部署，配置好的环境变量和 volume 都会保留。
+
+#### 升级和维护
+
+- **升级**：合并新代码到部署分支，Northflank 会自动 redeploy（如果开了 auto-deploy），或手动 **Service → Build & deploy**
+- **改环境变量**：Service → Environment → 改完点 **Save** → 自动滚动重启，volume 数据保留
+- **查看日志**：Service → Logs（实时 + 历史）
+- **进容器调试**：Service → Containers → Shell（直接开 web 终端）
+
+#### 成本
+
+Northflank 注册即送试用额度（按 vCPU·小时 + 内存·小时 + 存储·GB-月 计费），nf-compute-20 (0.5 vCPU / 512 MB) + 1 GB volume 长期跑 1 个实例，单月成本通常在试用额度内或非常小（具体见 [Northflank Pricing](https://northflank.com/pricing)）。
+
+> 💡 **为什么推荐 Northflank 而不是 Render 免费版？** Render 免费 Web Service 没有持久磁盘、容器休眠，不适合本项目。Northflank 容器长期运行 + 原生支持 volume，配 `DATA_SAVE_MODE=file` 体验和自家 VPS 一样。
+
 ### Render 部署
 
 1. 创建 **Web Service**，连接 GitHub
@@ -251,7 +377,7 @@ REDIS_TOKEN=...
 
 Node.js 18+，先 `npm run build:webui` 再 `npm start` 即可。
 
-> Railway / Fly.io 默认有持久卷（volume）支持，可用 `DATA_SAVE_MODE=file`（需挂卷到 `data/`）；嫌麻烦也可以直接用 `redis` 模式，跨平台一致。
+> Railway / Fly.io 默认有持久卷（volume）支持，可用 `DATA_SAVE_MODE=file`（需挂卷到 `data/`）；嫌麻烦也可以直接用 `redis` 模式，跨平台一致。Northflank 用法见上文 [Northflank 部署](#northflank-部署推荐白嫖友好--长期运行--持久卷)。
 
 > Cloudflare Workers / Pages Functions 暂不支持（不是 Node.js 运行时），路线图与 workaround 见 [docs/cloudflare-workers.md](docs/cloudflare-workers.md)。
 
@@ -482,7 +608,7 @@ cd webui && npm run dev                     # 开发
 | 模式 | 使用场景 | 存储位置 |
 |---|---|---|
 | `none`（默认） | 任何平台 | 内存；重启即丢，账号靠 `ACCOUNTS` env 重新登录 |
-| `file` | 本地 / Docker / VPS / Render | `data/data.json` |
+| `file` | 本地 / Docker / VPS / **Northflank** / Render（付费 Disks） | `data/data.json` |
 | `redis` | **Vercel / Netlify / Cloudflare Workers** 等 serverless | Redis-over-HTTP（兼容 Upstash REST 协议） |
 
 > ⚠️ **Vercel 不支持 `file` 模式**：serverless 容器无持久磁盘，每次冷启动 `data/data.json` 都会丢失，账号 token 和代理状态都会重置。Vercel 部署请用 `redis` 模式。
