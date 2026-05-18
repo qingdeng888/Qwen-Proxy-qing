@@ -154,17 +154,38 @@ router.post('/refreshAccount', adminKeyVerify, async (req, res) => {
 })
 
 /**
- * POST /refreshAllAccounts - Refresh all account tokens
+ * POST /refreshAllAccounts - Force-refresh every account's token.
+ *
+ * Default behavior is "force": when the operator clicks "刷新全部" in the
+ * admin UI they expect every account re-logged in NOW, regardless of
+ * remaining validity. The previous default-24h-threshold meant the
+ * button silently no-oped on healthy tokens (ones with > 24h left),
+ * which looked like a broken button.
+ *
+ * Optional body params:
+ *   - force          (default true)  refresh all candidates
+ *   - thresholdHours (default 24)    only used when force=false; same
+ *                                    semantics as the internal 6h timer
+ *
+ * Returns: { message, total, refreshed, failed, thresholdHours, force }
  */
 router.post('/refreshAllAccounts', adminKeyVerify, async (req, res) => {
   try {
-    const { thresholdHours = 24 } = req.body
-    const refreshedCount = await accountManager.autoRefreshTokens(thresholdHours)
+    const body = req.body || {}
+    const force = body.force !== false // default true
+    const thresholdHours = Number(body.thresholdHours)
+    const threshold = Number.isFinite(thresholdHours) && thresholdHours > 0 ? thresholdHours : 24
+    const result = await accountManager.autoRefreshTokens(threshold, force)
 
     res.json({
       message: 'Batch refresh complete',
-      refreshedCount,
-      thresholdHours
+      total: result.total,
+      refreshed: result.refreshed,
+      failed: Math.max(0, result.total - result.refreshed),
+      // Legacy field name kept for clients still reading refreshedCount.
+      refreshedCount: result.refreshed,
+      thresholdHours: threshold,
+      force,
     })
   } catch (error) {
     logger.error('Failed to batch refresh account tokens', 'ACCOUNT', '', error)
