@@ -32,6 +32,27 @@ const app = express()
 // Initialize SSXMOD Cookie manager
 initSsxmodManager()
 
+// Start the chat_id warmup pool (keeps pre-created chat_ids ready so
+// requests after idle don't suffer cold-start latency on /chats/new).
+// Skipped in serverless environments where setInterval doesn't persist.
+if (!config.isServerless) {
+  const { chatIdPool } = require('./utils/chat-id-pool')
+  const accountManager = require('./utils/account.js')
+  // Defer start until the account manager is ready (it may still be
+  // logging in on first boot). The pool's start() handles ensureInitialized
+  // internally, but we want to kick it off after the server module loads.
+  setImmediate(async () => {
+    try {
+      if (typeof accountManager.ensureInitialized === 'function') {
+        await accountManager.ensureInitialized()
+      }
+      await chatIdPool.start(accountManager)
+    } catch (err) {
+      logger.warn(`[ChatIdPool] Failed to start: ${err.message}`, 'WARMUP')
+    }
+  })
+}
+
 app.use(bodyParser.json({ limit: '128mb' }))
 app.use(bodyParser.urlencoded({ limit: '128mb', extended: true }))
 app.use(cors())
@@ -48,6 +69,16 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' })
+})
+
+// Chat ID pool stats (useful for debugging warmup health)
+app.get('/api/pool-stats', (req, res) => {
+  try {
+    const { chatIdPool } = require('./utils/chat-id-pool')
+    res.json({ status: 'ok', pool: chatIdPool.getStats() })
+  } catch {
+    res.json({ status: 'unavailable', pool: null })
+  }
 })
 
 // API routes

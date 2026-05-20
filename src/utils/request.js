@@ -5,6 +5,7 @@ const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, buildAgentForUrl, getProxyHost } = require('./proxy-helper')
 const usageTracker = require('./usage-tracker')
+const { chatIdPool } = require('./chat-id-pool')
 
 // Errors that look like the proxy is dead (TCP-level / DNS / handshake).
 // Anything in this set on a proxied request triggers proxy failover.
@@ -204,6 +205,14 @@ const sendChatRequest = async (body) => {
  * @returns {Promise<string|null>} Generated chat_id or null
  */
 const generateChatID = async (currentToken, model, email = null, proxyUrl = null, proxyMode = 'smart') => {
+    // Fast path: try the warmup pool first (avoids 500ms–6s /chats/new latency)
+    if (email) {
+        const pooled = chatIdPool.acquire(email)
+        if (pooled) {
+            return pooled
+        }
+    }
+
     try {
         const chatBaseUrl = getChatBaseUrl()
 
