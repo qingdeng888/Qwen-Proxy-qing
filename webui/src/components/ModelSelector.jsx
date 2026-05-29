@@ -38,10 +38,10 @@ export default function ModelSelector({ value, onChange }) {
           baseIds.push(base)
         }
       }
-      setModels(baseIds.length > 0 ? baseIds : ['qwen3.6-plus'])
+      setModels(baseIds.length > 0 ? baseIds : ['qwen3-235b-a22b'])
     } catch {
       // fallback
-      setModels(['qwen3.6-plus'])
+      setModels(['qwen3-235b-a22b'])
     } finally {
       setLoading(false)
     }

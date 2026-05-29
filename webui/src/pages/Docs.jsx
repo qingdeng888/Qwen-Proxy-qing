@@ -12,7 +12,7 @@ const endpoints = [
     description: '创建聊天补全，支持流式输出。兼容 OpenAI 格式。',
     auth: true,
     body: {
-      model: 'qwen3.6-plus',
+      model: 'qwen3-235b-a22b',
       messages: [{ role: 'user', content: 'Hello!' }],
       stream: false,
     },
@@ -38,9 +38,9 @@ const endpoints = [
     response: {
       object: 'list',
       data: [
-        { id: 'qwen3.6-plus', object: 'model', owned_by: 'qwen' },
-        { id: 'qwen3.6-plus-thinking', object: 'model', owned_by: 'qwen' },
-        { id: 'qwen3.6-plus-search', object: 'model', owned_by: 'qwen' },
+        { id: 'qwen3-235b-a22b', object: 'model', owned_by: 'qwen' },
+        { id: 'qwen3-235b-a22b-thinking', object: 'model', owned_by: 'qwen' },
+        { id: 'qwen3-235b-a22b-search', object: 'model', owned_by: 'qwen' },
       ],
     },
     notes: [
@@ -58,7 +58,7 @@ const endpoints = [
     description: '根据文本提示生成图片。兼容 OpenAI 格式。',
     auth: true,
     body: {
-      model: 'qwen3.6-plus-image',
+      model: 'qwen3-235b-a22b-image',
       prompt: 'A beautiful sunset over mountains',
       n: 1,
       size: '1024x1024',
@@ -76,7 +76,7 @@ const endpoints = [
     title: '图片编辑',
     description: '通过文本指令编辑图片。支持 multipart 上传。',
     auth: true,
-    body: { image: '<file>', prompt: 'Make the sky blue', model: 'qwen3.6-plus-image-edit' },
+    body: { image: '<file>', prompt: 'Make the sky blue', model: 'qwen3-235b-a22b-image-edit' },
     response: { created: 1700000000, data: [{ url: 'https://...' }] },
     notes: ['Multipart form-data 上传', '使用带 `-image-edit` 后缀的模型'],
   },
@@ -87,7 +87,7 @@ const endpoints = [
     title: '视频生成',
     description: '根据文本提示生成视频。',
     auth: true,
-    body: { model: 'qwen3.6-plus-video', prompt: 'A cat playing piano' },
+    body: { model: 'qwen3-235b-a22b-video', prompt: 'A cat playing piano' },
     response: { data: [{ url: 'https://...' }] },
     notes: ['使用带 `-video` 后缀的模型', '处理时间可能较长'],
   },
@@ -102,7 +102,7 @@ const endpoints = [
     auth: true,
     authHeader: 'x-api-key',
     body: {
-      model: 'qwen3.6-plus',
+      model: 'qwen3-235b-a22b',
       max_tokens: 1024,
       messages: [{ role: 'user', content: 'Hello, Claude' }],
       stream: false,
@@ -111,7 +111,7 @@ const endpoints = [
       id: 'msg_xxx',
       type: 'message',
       role: 'assistant',
-      model: 'qwen3.6-plus',
+      model: 'qwen3-235b-a22b',
       content: [{ type: 'text', text: 'Hello!' }],
       stop_reason: 'end_turn',
       usage: { input_tokens: 10, output_tokens: 5 },
@@ -131,7 +131,7 @@ const endpoints = [
     auth: true,
     authHeader: 'x-api-key',
     body: {
-      model: 'qwen3.6-plus',
+      model: 'qwen3-235b-a22b',
       max_tokens: 1024,
       messages: [{ role: 'user', content: 'Hi' }],
     },
@@ -166,7 +166,7 @@ const endpoints = [
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
     },
     notes: [
-      '路径中 `{model}` 替换为模型名，例如 `qwen3.6-plus`',
+      '路径中 `{model}` 替换为模型名，例如 `qwen3-235b-a22b`',
       '同时支持 `/v1/models/{model}:generateContent`',
       '支持 `x-goog-api-key` 头、查询参数 `?key=...`、`Authorization: Bearer ...`',
     ],
@@ -301,7 +301,7 @@ function EndpointCard({ endpoint }) {
   const cat = categoryMeta[endpoint.category] || categoryMeta.public
 
   // 路径中的 {model} 占位符不能直接发请求，需要特殊处理
-  const tryablePath = endpoint.path.replace('{model}', 'qwen3.6-plus')
+  const tryablePath = endpoint.path.replace('{model}', 'qwen3-235b-a22b')
   const isTryable = !endpoint.path.includes('{')
 
   const handleTry = async () => {

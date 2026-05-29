@@ -4,11 +4,13 @@ const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
 
 let cachedModels = null
+let cacheTime = 0
 let fetchPromise = null
+const CACHE_TTL = 30 * 60 * 1000 // 30 minutes
 
 const getLatestModels = async (force = false) => {
-    // If cached and not forcing refresh, return cache
-    if (cachedModels && !force) {
+    // If cached, not forcing refresh, and cache is still fresh, return cache
+    if (cachedModels && !force && (Date.now() - cacheTime < CACHE_TTL)) {
         return cachedModels
     }
 
@@ -24,7 +26,10 @@ const getLatestModels = async (force = false) => {
         headers: {
             'Authorization': `Bearer ${accountManager.getAccountToken()}`,
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+            'source': 'web',
+            'version': '0.2.57',
+            'bx-v': '2.5.36',
             ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })
         }
     }
@@ -36,15 +41,26 @@ const getLatestModels = async (force = false) => {
 
     fetchPromise = axios.get(`${chatBaseUrl}/api/models`, requestConfig).then(response => {
         cachedModels = response.data.data
+        cacheTime = Date.now()
         fetchPromise = null
         return cachedModels
     }).catch(error => {
         console.error('Error fetching latest models:', error.message)
         fetchPromise = null
+        // If we have stale cache, return it rather than empty
+        if (cachedModels) return cachedModels
         return []
     })
 
     return fetchPromise
+}
+
+/**
+ * Clear model cache (useful when accounts change or for manual refresh)
+ */
+const clearModelCache = () => {
+    cachedModels = null
+    cacheTime = 0
 }
 
 /**
@@ -60,5 +76,6 @@ const getDefaultModelByChatType = async (chatType) => {
 
 module.exports = {
     getLatestModels,
-    getDefaultModelByChatType
+    getDefaultModelByChatType,
+    clearModelCache
 }
