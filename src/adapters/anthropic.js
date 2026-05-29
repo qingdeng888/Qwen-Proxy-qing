@@ -125,7 +125,7 @@ function anthropicToOpenAI(anthropicBody) {
   }
 
   const out = {
-    model: anthropicBody.model || 'qwen3.6-plus',
+    model: anthropicBody.model || 'qwen3-235b-a22b',
     messages,
     max_tokens: anthropicBody.max_tokens,
     stream: anthropicBody.stream || false,

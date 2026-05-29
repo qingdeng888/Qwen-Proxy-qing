@@ -27,4 +27,4 @@ export const STORAGE_KEYS = {
   ENABLE_SEARCH: 'qwen2api_enable_search',
 }
 
-export const DEFAULT_MODEL = 'qwen3.6-plus'
+export const DEFAULT_MODEL = 'qwen3-235b-a22b'

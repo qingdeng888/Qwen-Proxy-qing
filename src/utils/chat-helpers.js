@@ -9,6 +9,9 @@ const MODEL_SUFFIXES = [
     '-thinking-search',
     '-image-edit',
     '-deep-research',
+    '-webdev',
+    '-web-dev',
+    '-slides',
     '-thinking',
     '-search',
     '-video',
@@ -180,6 +183,8 @@ const isChatType = (model) => {
     if (model.includes('-image')) return 't2i'
     if (model.includes('-video')) return 't2v'
     if (model.includes('-deep-research')) return 'deep_research'
+    if (model.includes('-webdev') || model.includes('-web-dev')) return 'web_dev'
+    if (model.includes('-slides')) return 'slides'
     return 't2t'
 }
 
@@ -240,7 +245,7 @@ const isThinkingEnabled = (model, enable_thinking, thinking_budget, reasoning_ef
  * @returns {Promise<string>} Parsed model name
  */
 const parserModel = async (model) => {
-    if (!model) return 'qwen3.6-plus'
+    if (!model) return 'qwen3-235b-a22b'
 
     try {
         const { baseModel } = splitModelSuffix(model)
@@ -250,7 +255,7 @@ const parserModel = async (model) => {
         return matchedModel?.id || baseModel
     } catch (e) {
         const { baseModel } = splitModelSuffix(model)
-        return baseModel || 'qwen3.6-plus'
+        return baseModel || 'qwen3-235b-a22b'
     }
 }
 

@@ -41,11 +41,20 @@ const handleGetModels = async (req, res) => {
             continue
         }
 
-        const isThinking = model?.info?.meta?.abilities?.thinking
-        const isSearch = model?.info?.meta?.chat_type?.includes('search')
-        const isImage = model?.info?.meta?.chat_type?.includes('t2i')
-        const isVideo = model?.info?.meta?.chat_type?.includes('t2v')
-        const isImageEdit = model?.info?.meta?.chat_type?.includes('image_edit')
+        // Compatible with both old (abilities) and new (capabilities) API structures
+        const meta = model?.info?.meta || {}
+        const caps = meta.capabilities || {}
+        const abilities = meta.abilities || {}
+        const chatTypes = meta.chat_type || []
+
+        const isThinking = !!(caps.thinking || abilities.thinking)
+        const isSearch = !!(caps.search || chatTypes.includes('search'))
+        const isImage = chatTypes.includes('t2i')
+        const isVideo = chatTypes.includes('t2v')
+        const isImageEdit = chatTypes.includes('image_edit')
+        const isDeepResearch = chatTypes.includes('deep_research')
+        const isWebDev = chatTypes.includes('web_dev')
+        const isSlides = chatTypes.includes('slides')
 
         if (isThinking) {
             models.push(buildPublicModelData(model, '-thinking'))
@@ -69,6 +78,18 @@ const handleGetModels = async (req, res) => {
 
         if (isImageEdit) {
             models.push(buildPublicModelData(model, '-image-edit'))
+        }
+
+        if (isDeepResearch) {
+            models.push(buildPublicModelData(model, '-deep-research'))
+        }
+
+        if (isWebDev) {
+            models.push(buildPublicModelData(model, '-webdev'))
+        }
+
+        if (isSlides) {
+            models.push(buildPublicModelData(model, '-slides'))
         }
     }
 

@@ -42,7 +42,7 @@ const anthropicKeyVerify = (req, res, next) => {
 const handleAnthropicMessages = async (req, res) => {
   try {
     const anthropicBody = req.body
-    const requestedModel = anthropicBody.model || 'qwen3.6-plus'
+    const requestedModel = anthropicBody.model || 'qwen3-235b-a22b'
     const isStream = anthropicBody.stream || false
 
     // Stats: bump the API key bucket once per client request.
