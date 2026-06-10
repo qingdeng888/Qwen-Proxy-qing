@@ -158,6 +158,7 @@ const sendChatRequest = async (body) => {
             }, requestConfig)
 
             if (response.status === 200) {
+                logger.info(`[DEBUG] Request succeeded, status=200, starting to stream response`, 'REQUEST')
                 return {
                     currentToken: currentToken,
                     currentEmail: currentEmail,

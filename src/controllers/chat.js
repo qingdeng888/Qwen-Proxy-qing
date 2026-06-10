@@ -97,9 +97,17 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             writeChunk({ tool_calls: deltas })
         }
 
+        let debugStreamChunkCount = 0
+
         response.on('data', async (chunk) => {
             const decodeText = decoder.decode(chunk, { stream: true })
             buffer += decodeText
+
+            // DEBUG: log first 3 raw upstream chunks
+            debugStreamChunkCount++
+            if (debugStreamChunkCount <= 3) {
+                logger.info(`[DEBUG-STREAM] Raw chunk #${debugStreamChunkCount}: ${decodeText.slice(0, 500)}`, 'CHAT')
+            }
 
             const chunks = []
             let startIndex = 0
@@ -283,6 +291,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         let currentPhase = null
         let appendedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
+        let debugChunkCount = 0
 
         let totalTokens = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
 
@@ -290,6 +299,12 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             response.on('data', async (chunk) => {
                 const decodeText = decoder.decode(chunk, { stream: true })
                 buffer += decodeText
+
+                // DEBUG: log first 3 raw upstream chunks
+                debugChunkCount++
+                if (debugChunkCount <= 3) {
+                    logger.info(`[DEBUG-NONSTREAM] Raw chunk #${debugChunkCount}: ${decodeText.slice(0, 500)}`, 'CHAT')
+                }
 
                 const chunks = []
                 let startIndex = 0
@@ -432,6 +447,8 @@ const handleChatCompletion = async (req, res) => {
 
     try {
         const response_data = await sendChatRequest(req.body)
+
+        logger.info(`[DEBUG] sendChatRequest result: status=${response_data.status}, hasResponse=${!!response_data.response}, email=${response_data.currentEmail}`, 'CHAT')
 
         if (!response_data.status || !response_data.response) {
             try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
