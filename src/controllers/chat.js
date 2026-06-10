@@ -97,9 +97,17 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             writeChunk({ tool_calls: deltas })
         }
 
+        let debugChunkCount = 0  // DEBUG counter
+
         response.on('data', async (chunk) => {
             const decodeText = decoder.decode(chunk, { stream: true })
             buffer += decodeText
+
+            // DEBUG: log first 3 raw chunks from upstream
+            debugChunkCount++
+            if (debugChunkCount <= 3) {
+                logger.info(`[DEBUG-STREAM] Raw upstream chunk #${debugChunkCount}: ${decodeText.slice(0, 300)}`, 'CHAT')
+            }
 
             const chunks = []
             let startIndex = 0
@@ -165,6 +173,12 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
 
                     if (!delta || !delta.content ||
                         (delta.phase !== 'think' && delta.phase !== 'answer')) {
+                        // DEBUG: log skipped deltas that have content but wrong/missing phase
+                        if (delta && delta.content && delta.phase !== 'think' && delta.phase !== 'answer') {
+                            if (debugChunkCount <= 5) {
+                                logger.info(`[DEBUG-STREAM] Skipping delta with content but phase="${delta.phase}": ${JSON.stringify(delta).slice(0, 200)}`, 'CHAT')
+                            }
+                        }
                         continue
                     }
 
@@ -281,6 +295,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         let currentPhase = null
         let appendedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
+        let debugFirstChunks = []  // DEBUG: capture first few raw chunks
 
         let totalTokens = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
 
@@ -288,6 +303,12 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             response.on('data', async (chunk) => {
                 const decodeText = decoder.decode(chunk, { stream: true })
                 buffer += decodeText
+
+                // DEBUG: log first 3 raw chunks
+                if (debugFirstChunks.length < 3) {
+                    debugFirstChunks.push(decodeText.slice(0, 500))
+                    logger.info(`[DEBUG] Raw upstream chunk #${debugFirstChunks.length}: ${decodeText.slice(0, 300)}`, 'CHAT')
+                }
 
                 const chunks = []
                 let startIndex = 0

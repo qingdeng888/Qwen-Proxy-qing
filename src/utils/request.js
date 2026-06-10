@@ -151,11 +151,15 @@ const sendChatRequest = async (body) => {
             const chat_id = await generateChatID(currentToken, body.model, currentEmail, currentProxy, proxyDecision.mode)
 
             logger.network(`Sending chat request (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(currentProxy)})`, 'REQUEST')
+            logger.info(`[DEBUG] Request URL: ${chatBaseUrl}/api/v2/chat/completions?chat_id=${chat_id}`, 'REQUEST')
+            logger.info(`[DEBUG] Request model: ${body.model}, chat_type: ${body.chat_type}`, 'REQUEST')
             const response = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id, {
                 ...body,
                 stream: true,
                 chat_id: chat_id
             }, requestConfig)
+
+            logger.info(`[DEBUG] Response status: ${response.status}, headers content-type: ${response.headers && response.headers['content-type']}`, 'REQUEST')
 
             if (response.status === 200) {
                 return {
@@ -171,6 +175,11 @@ const sendChatRequest = async (body) => {
             lastError = error
             try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
             logger.error(`Chat request failed (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(currentProxy)}): ${error.message}`, 'REQUEST')
+            // Log more error details for debugging
+            if (error.response) {
+                logger.error(`[DEBUG] Upstream response status: ${error.response.status}`, 'REQUEST')
+                logger.error(`[DEBUG] Upstream response data: ${JSON.stringify(error.response.data).slice(0, 500)}`, 'REQUEST')
+            }
 
             // Only proxy-shaped errors are retryable. Auth errors, 4xx and
             // upstream-format failures should bail immediately so the
@@ -256,8 +265,8 @@ const generateChatID = async (currentToken, model, email = null, proxyUrl = null
         const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
             "title": "New Chat",
             "models": [model],
-            "chat_mode": "local",
-            "chat_type": "t2i",
+            "chat_mode": "normal",
+            "chat_type": "t2t",
             "timestamp": new Date().getTime()
         }, requestConfig)
 
