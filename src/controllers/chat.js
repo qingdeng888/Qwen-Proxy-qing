@@ -163,15 +163,17 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                         }
                     }
 
-                    if (!delta || !delta.content ||
-                        (delta.phase !== 'think' && delta.phase !== 'answer')) {
+                    if (!delta || !delta.content) {
                         continue
                     }
+
+                    // Determine phase: upstream may omit delta.phase (treat as 'answer')
+                    const phase = delta.phase || 'answer'
 
                     let content = delta.content
                     completionContent += content
 
-                    if (delta.phase === 'think') {
+                    if (phase === 'think') {
                         // Thinking phase: send as reasoning_content (OpenAI standard)
                         if (currentPhase !== 'think') {
                             currentPhase = 'think'
@@ -182,8 +184,8 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                             }
                         }
                         writeChunk({ "reasoning_content": content })
-                    } else if (delta.phase === 'answer') {
-                        // Answer phase: send as content
+                    } else {
+                        // Answer phase (or no phase): send as content
                         if (currentPhase === 'think') {
                             // Flush pending images when transitioning from think to answer
                             if (pendingImageMarkdownList.length > 0) {
@@ -336,18 +338,20 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                             }
                         }
 
-                        if (!delta || !delta.content || (delta.phase !== 'think' && delta.phase !== 'answer')) continue
+                        if (!delta || !delta.content) continue
 
+                        // Determine phase: upstream may omit delta.phase (treat as 'answer')
+                        const phase = delta.phase || 'answer'
                         let content = delta.content
 
-                        if (delta.phase === 'think') {
+                        if (phase === 'think') {
                             if (currentPhase !== 'think' && web_search_info) {
                                 const searchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
                                 reasoningContent += searchTable + '\n\n'
                             }
                             currentPhase = 'think'
                             reasoningContent += content
-                        } else if (delta.phase === 'answer') {
+                        } else {
                             if (currentPhase === 'think' && pendingImageMarkdownList.length > 0) {
                                 fullContent += `${pendingImageMarkdownList.join('\n\n')}\n\n`
                                 pendingImageMarkdownList.forEach(item => appendedImageMarkdownSet.add(item))

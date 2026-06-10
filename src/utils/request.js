@@ -256,8 +256,8 @@ const generateChatID = async (currentToken, model, email = null, proxyUrl = null
         const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
             "title": "New Chat",
             "models": [model],
-            "chat_mode": "local",
-            "chat_type": "t2i",
+            "chat_mode": "normal",
+            "chat_type": "t2t",
             "timestamp": new Date().getTime()
         }, requestConfig)
 
