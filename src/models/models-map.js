@@ -1,6 +1,5 @@
 const axios = require('axios')
 const accountManager = require('../utils/account.js')
-const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
 
 let cachedModels = null
@@ -26,11 +25,17 @@ const getLatestModels = async (force = false) => {
         headers: {
             'Authorization': `Bearer ${accountManager.getAccountToken()}`,
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
-            'source': 'web',
-            'version': '0.2.57',
-            'bx-v': '2.5.36',
-            ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Origin': chatBaseUrl,
+            'Referer': `${chatBaseUrl}/`,
+            'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
         }
     }
 

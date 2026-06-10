@@ -27,7 +27,6 @@
 
 const axios = require('axios')
 const { logger } = require('./logger')
-const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
 
 class ChatIdPool {
@@ -220,11 +219,19 @@ class ChatIdPool {
             const requestConfig = {
                 headers: {
                     'Authorization': `Bearer ${token}`,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
-                    'Connection': 'keep-alive',
-                    'Accept': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
                     'Content-Type': 'application/json',
-                    'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+                    'Connection': 'keep-alive',
+                    'Origin': chatBaseUrl,
+                    'Referer': `${chatBaseUrl}/`,
+                    'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-origin',
                 },
                 timeout: 15000, // 15s timeout for prewarm (generous)
             }
