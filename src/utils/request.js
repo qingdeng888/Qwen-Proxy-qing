@@ -5,6 +5,7 @@ const { logger } = require('./logger')
 const { getProxyAgent, getChatBaseUrl, buildAgentForUrl, getProxyHost } = require('./proxy-helper')
 const usageTracker = require('./usage-tracker')
 const { chatIdPool } = require('./chat-id-pool')
+const { requestJitter, accountRateLimiter, detectUpstreamBlock, deleteChatAfterUse } = require('./request-fingerprint')
 
 // Errors that look like the proxy is dead (TCP-level / DNS / handshake).
 // Anything in this set on a proxied request triggers proxy failover.
@@ -91,6 +92,14 @@ const sendChatRequest = async (body) => {
             return { status: false, response: null }
         }
 
+        // Skip rate-limited accounts
+        if (currentEmail && accountRateLimiter.isLimited(currentEmail)) {
+            logger.warn(`Skipping rate-limited account: ${currentEmail}`, 'RATELIMIT')
+            continue
+        }
+
+        // Anti-detection: random jitter before each request
+        await requestJitter()
         // Bump per-account "totalRequests" counter for this attempt. A
         // single client request that retries N times will count as N
         // attempts on the rotated accounts — that's intentional, it
@@ -154,6 +163,16 @@ const sendChatRequest = async (body) => {
 
             if (response.status === 200) {
                 logger.info(`[DEBUG] Request succeeded, status=200, starting to stream response`, 'REQUEST')
+
+                // Clear rate limit on successful connection
+                accountRateLimiter.clearLimit(currentEmail)
+
+                // Schedule chat deletion after stream ends (reduce account footprint)
+                const chatBaseUrlForCleanup = getChatBaseUrl()
+                response.data.once('end', () => {
+                    deleteChatAfterUse(axios, chatBaseUrlForCleanup, currentToken, chat_id)
+                })
+
                 return {
                     currentToken: currentToken,
                     currentEmail: currentEmail,

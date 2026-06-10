@@ -6,6 +6,7 @@ const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
 const { createSieve, parseToolCallsFromText } = require('../utils/toolcall.js')
 const usageTracker = require('../utils/usage-tracker.js')
+const { detectUpstreamBlock, accountRateLimiter } = require('../utils/request-fingerprint')
 
 /**
  * Set response headers
@@ -107,6 +108,14 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             debugStreamChunkCount++
             if (debugStreamChunkCount <= 3) {
                 logger.info(`[DEBUG-STREAM] Raw chunk #${debugStreamChunkCount}: ${decodeText.slice(0, 500)}`, 'CHAT')
+
+                // Detect captcha/rate-limit on first chunk
+                if (debugStreamChunkCount === 1) {
+                    const blockCheck = detectUpstreamBlock(decodeText)
+                    if (blockCheck.blocked) {
+                        logger.error(`[RISK-CONTROL] Stream blocked: ${blockCheck.reason}`, 'CHAT')
+                    }
+                }
             }
 
             const chunks = []

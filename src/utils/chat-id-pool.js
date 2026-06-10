@@ -31,9 +31,9 @@ const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
 
 class ChatIdPool {
     constructor(options = {}) {
-        this.targetPerAccount = parseInt(process.env.CHAT_POOL_SIZE_PER_ACCOUNT) || options.targetPerAccount || 3
-        this.ttlMs = (parseInt(process.env.CHAT_POOL_TTL_SECONDS) || options.ttlSeconds || 600) * 1000
-        this.refillIntervalMs = (parseInt(process.env.CHAT_POOL_REFILL_INTERVAL) || options.refillInterval || 30) * 1000
+        this.targetPerAccount = parseInt(process.env.CHAT_POOL_SIZE_PER_ACCOUNT) || options.targetPerAccount || 2
+        this.ttlMs = (parseInt(process.env.CHAT_POOL_TTL_SECONDS) || options.ttlSeconds || 120) * 1000
+        this.refillIntervalMs = (parseInt(process.env.CHAT_POOL_REFILL_INTERVAL) || options.refillInterval || 60) * 1000
         this.defaultModel = process.env.CHAT_POOL_DEFAULT_MODEL || options.defaultModel || 'qwen3-235b-a22b'
 
         // Map<email, Array<{ chatId: string, createdAt: number }>>
