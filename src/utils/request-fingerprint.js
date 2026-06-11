@@ -117,6 +117,11 @@ class AccountRateLimiter {
 const detectUpstreamBlock = (rawChunk) => {
     if (!rawChunk) return { blocked: false, reason: '' }
 
+    // Detect Aliyun WAF HTML page
+    if (rawChunk.includes('aliyun_waf_') || rawChunk.includes('<!doctypehtml>') || rawChunk.includes('<!DOCTYPE html>')) {
+        return { blocked: true, reason: 'waf_blocked' }
+    }
+
     // Detect RGV587 captcha challenge
     if (rawChunk.includes('RGV587') || rawChunk.includes('_____tmd_____') || rawChunk.includes('punish')) {
         return { blocked: true, reason: 'captcha_challenge' }

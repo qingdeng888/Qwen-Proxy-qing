@@ -109,7 +109,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             if (debugStreamChunkCount <= 3) {
                 logger.info(`[DEBUG-STREAM] Raw chunk #${debugStreamChunkCount}: ${decodeText.slice(0, 500)}`, 'CHAT')
 
-                // Detect captcha/rate-limit on first chunk
+                // Detect WAF/captcha/rate-limit on first chunk
                 if (debugStreamChunkCount === 1) {
                     const blockCheck = detectUpstreamBlock(decodeText)
                     if (blockCheck.blocked) {
@@ -313,6 +313,14 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 debugChunkCount++
                 if (debugChunkCount <= 3) {
                     logger.info(`[DEBUG-NONSTREAM] Raw chunk #${debugChunkCount}: ${decodeText.slice(0, 500)}`, 'CHAT')
+
+                    // Detect WAF/captcha/rate-limit on first chunk
+                    if (debugChunkCount === 1) {
+                        const blockCheck = detectUpstreamBlock(decodeText)
+                        if (blockCheck.blocked) {
+                            logger.error(`[RISK-CONTROL] Non-stream blocked: ${blockCheck.reason}`, 'CHAT')
+                        }
+                    }
                 }
 
                 const chunks = []
