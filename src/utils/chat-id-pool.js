@@ -8,26 +8,17 @@
  * instead of waiting for the synchronous POST /api/v2/chats/new call
  * (which takes 500ms–6s depending on upstream load).
  *
- * This solves the "idle → tool call broken" problem:
- * - After idle, connections/sessions go cold on the upstream side
- * - The first synchronous /chats/new call after idle often times out
- *   or returns a "degraded" chat_id that doesn't support tool calling
- * - The warmup pool keeps fresh chat_ids always ready, and the
- *   background refill loop keeps the upstream connection warm
- *
- * Inspired by qwen2API's ChatIdPool (Python asyncio version).
- * Adapted to Node.js with setInterval-based background loop.
+ * Now uses HTTP/2 + cookies from browser login to bypass WAF.
  *
  * Configuration (env vars):
- *   CHAT_POOL_SIZE_PER_ACCOUNT  — target pool size per account (default: 3)
- *   CHAT_POOL_TTL_SECONDS       — chat_id TTL in seconds (default: 600 = 10min)
- *   CHAT_POOL_REFILL_INTERVAL   — refill check interval in seconds (default: 30)
+ *   CHAT_POOL_SIZE_PER_ACCOUNT  — target pool size per account (default: 2)
+ *   CHAT_POOL_TTL_SECONDS       — chat_id TTL in seconds (default: 120)
+ *   CHAT_POOL_REFILL_INTERVAL   — refill check interval in seconds (default: 60)
  *   CHAT_POOL_DEFAULT_MODEL     — model used for pre-warming (default: qwen3-235b-a22b)
  */
 
-const axios = require('axios')
 const { logger } = require('./logger')
-const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
+const { http2Request } = require('./http2-client')
 
 class ChatIdPool {
     constructor(options = {}) {
@@ -88,8 +79,6 @@ class ChatIdPool {
 
     /**
      * Try to acquire a pre-warmed chat_id for the given account.
-     * Returns null if pool is empty or all entries expired (caller should
-     * fall back to synchronous creation).
      * @param {string} email - Account email
      * @returns {string|null} chat_id or null
      */
@@ -109,7 +98,6 @@ class ChatIdPool {
                 logger.info(`[ChatIdPool] HIT email=${email} chatId=${entry.chatId} pool_remaining=${queue.length}`, 'WARMUP')
                 return entry.chatId
             }
-            // Expired — discard and try next
             this._stats.expired++
         }
 
@@ -118,9 +106,7 @@ class ChatIdPool {
     }
 
     /**
-     * Remove a specific chat_id from the pool (e.g. after upstream error).
-     * @param {string} email
-     * @param {string} chatId
+     * Remove a specific chat_id from the pool.
      */
     invalidate(email, chatId) {
         if (!email || !chatId) return
@@ -134,8 +120,7 @@ class ChatIdPool {
     }
 
     /**
-     * Flush all chat_ids for a given account (e.g. after auth failure).
-     * @param {string} email
+     * Flush all chat_ids for a given account.
      */
     flushAccount(email) {
         if (!email) return
@@ -169,13 +154,12 @@ class ChatIdPool {
     // ─── Internal ──────────────────────────────────────────────────────
 
     /**
-     * One round of refill: check each valid account, top up if below target.
+     * One round of refill.
      * @private
      */
     async _refillOnce() {
         if (!this._accountManager) return
 
-        // Wait for account manager to be ready
         if (typeof this._accountManager.ensureInitialized === 'function') {
             try { await this._accountManager.ensureInitialized() } catch { return }
         }
@@ -205,54 +189,27 @@ class ChatIdPool {
     }
 
     /**
-     * Pre-create one chat_id for the given account and push to its queue.
+     * Pre-create one chat_id using HTTP/2 + cookies from browser login.
      * @private
      */
     async _prewarmOne(account) {
-        const { token, email } = account
+        const { token, email, cookies } = account
         if (!token || !email) return
 
         try {
-            const chatBaseUrl = getChatBaseUrl()
-            const proxyAgent = getProxyAgent()
-
-            const requestConfig = {
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                    'Content-Type': 'application/json',
-                    'Connection': 'keep-alive',
-                    'Origin': chatBaseUrl,
-                    'Referer': `${chatBaseUrl}/`,
-                    'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-                    'sec-ch-ua-mobile': '?0',
-                    'sec-ch-ua-platform': '"Windows"',
-                    'Sec-Fetch-Dest': 'empty',
-                    'Sec-Fetch-Mode': 'cors',
-                    'Sec-Fetch-Site': 'same-origin',
-                },
-                timeout: 15000, // 15s timeout for prewarm (generous)
-            }
-
-            if (proxyAgent) {
-                requestConfig.httpAgent = proxyAgent
-                requestConfig.httpsAgent = proxyAgent
-                requestConfig.proxy = false
-            }
-
-            const response = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
+            const { status, data } = await http2Request('POST', '/api/v2/chats/new', {
                 title: 'warmup',
                 models: [this.defaultModel],
                 chat_mode: 'normal',
                 chat_type: 't2t',
                 timestamp: Date.now(),
-            }, requestConfig)
+            }, token, cookies || '', {
+                timeout: 15000,
+            })
 
-            const chatId = response.data?.data?.id
+            const chatId = (status === 200 && data && data.data) ? data.data.id : null
             if (!chatId) {
-                logger.warn(`[ChatIdPool] Prewarm got empty chatId for ${email}`, 'WARMUP')
+                logger.warn(`[ChatIdPool] Prewarm got empty chatId for ${email} (status=${status})`, 'WARMUP')
                 this._stats.errors++
                 return
             }
@@ -265,10 +222,7 @@ class ChatIdPool {
             logger.info(`[ChatIdPool] Prewarmed email=${email} chatId=${chatId} pool_size=${queue.length}`, 'WARMUP')
         } catch (error) {
             this._stats.errors++
-            const msg = error.response
-                ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data).slice(0, 100)}`
-                : error.message
-            logger.warn(`[ChatIdPool] Prewarm failed for ${email}: ${msg}`, 'WARMUP')
+            logger.warn(`[ChatIdPool] Prewarm failed for ${email}: ${error.message}`, 'WARMUP')
         }
     }
 }

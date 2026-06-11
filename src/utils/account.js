@@ -168,12 +168,14 @@ class Account {
         for (let i = 0; i < accounts.length; i += concurrency) {
             const batch = accounts.slice(i, i + concurrency)
             const loginPromises = batch.map(async (account) => {
-                const token = await this.tokenManager.login(account.email, account.password)
+                const loginResult = await this.tokenManager.login(account.email, account.password)
+                const token = loginResult.token
                 if (token) {
                     const decoded = this.tokenManager.validateToken(token)
                     if (decoded) {
                         account.token = token
                         account.expires = decoded.exp
+                        account.cookies = loginResult.cookies || ''
                     }
                 }
                 return account
@@ -202,12 +204,14 @@ class Account {
                 continue
             }
             logger.info(`Token invalid, attempting re-login: ${account.email}`, 'TOKEN')
-            const newToken = await this.tokenManager.login(account.email, account.password)
+            const loginResult = await this.tokenManager.login(account.email, account.password)
+            const newToken = loginResult.token
             if (newToken) {
                 const decoded = this.tokenManager.validateToken(newToken)
                 if (decoded) {
                     account.token = newToken
                     account.expires = decoded.exp
+                    account.cookies = loginResult.cookies || ''
                     delete account.lastLoginError
                     continue
                 }
@@ -330,6 +334,17 @@ class Account {
      */
     getTokenByEmail(email) {
         return this.accountRotator.getTokenByEmail(email)
+    }
+
+    /**
+     * Get cookies for a specific account
+     * @param {string} email - Email address
+     * @returns {string} Cookie string or empty
+     */
+    getCookiesByEmail(email) {
+        if (!email) return ''
+        const account = this.accountTokens.find(acc => acc.email === email)
+        return (account && account.cookies) || ''
     }
 
     /**

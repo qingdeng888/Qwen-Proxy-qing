@@ -1,6 +1,6 @@
-const axios = require('axios')
 const accountManager = require('../utils/account.js')
-const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
+const { logger } = require('../utils/logger')
+const { http2Request } = require('../utils/http2-client')
 
 let cachedModels = null
 let cacheTime = 0
@@ -18,39 +18,27 @@ const getLatestModels = async (force = false) => {
         return fetchPromise
     }
 
-    const chatBaseUrl = getChatBaseUrl()
-    const proxyAgent = getProxyAgent()
+    const token = accountManager.getAccountToken()
+    // Get cookies from the first valid account for the models request
+    const accounts = accountManager.accountTokens || []
+    const firstValid = accounts.find(a => a.token && !a.disabled)
+    const cookies = (firstValid && firstValid.cookies) || ''
 
-    const requestConfig = {
-        headers: {
-            'Authorization': `Bearer ${accountManager.getAccountToken()}`,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Origin': chatBaseUrl,
-            'Referer': `${chatBaseUrl}/`,
-            'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin',
+    fetchPromise = http2Request('GET', '/api/models', null, token, cookies, {
+        timeout: 15000,
+    }).then(({ status, data }) => {
+        if (status === 200 && data && data.data) {
+            cachedModels = data.data
+            cacheTime = Date.now()
+        } else {
+            logger.warn(`[MODELS] Failed to fetch models, status=${status}`, 'MODELS')
+            if (cachedModels) return cachedModels
+            cachedModels = []
         }
-    }
-
-    if (proxyAgent) {
-        requestConfig.httpsAgent = proxyAgent
-        requestConfig.proxy = false
-    }
-
-    fetchPromise = axios.get(`${chatBaseUrl}/api/models`, requestConfig).then(response => {
-        cachedModels = response.data.data
-        cacheTime = Date.now()
         fetchPromise = null
         return cachedModels
     }).catch(error => {
-        console.error('Error fetching latest models:', error.message)
+        logger.error(`Error fetching latest models: ${error.message}`, 'MODELS')
         fetchPromise = null
         // If we have stale cache, return it rather than empty
         if (cachedModels) return cachedModels

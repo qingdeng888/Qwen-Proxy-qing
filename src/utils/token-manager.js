@@ -2,10 +2,19 @@ const axios = require('axios')
 const { sha256Encrypt, JwtDecode } = require('./tools')
 const { logger } = require('./logger')
 const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
+const { browserLogin, isBrowserLoginAvailable } = require('./browser-login')
 
 /**
  * Token Manager
  * Handles token acquisition, validation, and refresh
+ * 
+ * Login strategy (in order):
+ *   1. Playwright browser login (bypasses WAF/captcha) — preferred
+ *   2. HTTP API login (fallback if browser unavailable)
+ * 
+ * When browser login succeeds, cookies from the browser session are stored
+ * on the account object and included in subsequent API requests to maintain
+ * the WAF-authenticated session.
  */
 class TokenManager {
     constructor() {
@@ -24,11 +33,40 @@ class TokenManager {
 
     /**
      * Login to get token
+     * Strategy: try Playwright browser login first (bypasses WAF),
+     * then fallback to HTTP API login.
+     * 
      * @param {string} email - Email
      * @param {string} password - Password
-     * @returns {Promise<string|null>} Token or null
+     * @param {object} [options] - Options
+     * @param {string} [options.proxyUrl] - Proxy URL for browser/API
+     * @returns {Promise<{token: string|null, cookies: string}>} Token and cookies
      */
-    async login(email, password) {
+    async login(email, password, options = {}) {
+        // Strategy 1: Playwright browser login (preferred — bypasses WAF)
+        if (isBrowserLoginAvailable()) {
+            const result = await browserLogin(email, password, options)
+            if (result.success && result.token) {
+                logger.success(`${email} login successful (browser)`, 'AUTH')
+                return { token: result.token, cookies: result.cookies || '' }
+            }
+            logger.warn(`${email} browser login failed: ${result.error}, trying API fallback`, 'AUTH')
+        }
+
+        // Strategy 2: HTTP API login (fallback)
+        const token = await this._apiLogin(email, password, options)
+        return { token, cookies: '' }
+    }
+
+    /**
+     * HTTP API login (original method, kept as fallback)
+     * @param {string} email - Email
+     * @param {string} password - Password
+     * @param {object} [options] - Options
+     * @returns {Promise<string|null>} Token or null
+     * @private
+     */
+    async _apiLogin(email, password, options = {}) {
         try {
             const proxyAgent = getProxyAgent()
             const requestConfig = {
@@ -47,7 +85,7 @@ class TokenManager {
             }, requestConfig)
 
             if (response.data && response.data.token) {
-                logger.success(`${email} login successful`, 'AUTH')
+                logger.success(`${email} login successful (API)`, 'AUTH')
                 return response.data.token
             } else {
                 logger.error(`${email} login response missing token`, 'AUTH')
@@ -127,7 +165,8 @@ class TokenManager {
      */
     async refreshToken(account) {
         try {
-            const newToken = await this.login(account.email, account.password)
+            const loginResult = await this.login(account.email, account.password)
+            const newToken = loginResult.token
             if (!newToken) {
                 return null
             }
@@ -141,7 +180,8 @@ class TokenManager {
             const updatedAccount = {
                 ...account,
                 token: newToken,
-                expires: decoded.exp
+                expires: decoded.exp,
+                cookies: loginResult.cookies || account.cookies || '',
             }
 
             const remainingHours = this.getTokenRemainingHours(newToken)

@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/start.js",
     "dev": "nodemon src/start.js",
+    "install-browsers": "npx playwright install chromium",
     "build:webui": "cd webui && npm install && npm run build",
     "vercel-build": "cd webui && npm install && npm run build"
   },
@@ -31,6 +32,7 @@
     "jwt-decode": "^4.0.0",
     "mime-types": "^3.0.1",
     "multer": "^1.4.5-lts.1",
+    "playwright": "^1.52.0",
     "serverless-http": "^4.0.0",
     "socks-proxy-agent": "^8.0.5"
   },

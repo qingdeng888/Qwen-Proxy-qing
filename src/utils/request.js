@@ -6,6 +6,7 @@ const { getProxyAgent, getChatBaseUrl, buildAgentForUrl, getProxyHost } = requir
 const usageTracker = require('./usage-tracker')
 const { chatIdPool } = require('./chat-id-pool')
 const { requestJitter, accountRateLimiter, detectUpstreamBlock, deleteChatAfterUse } = require('./request-fingerprint')
+const { http2Stream, http2Request } = require('./http2-client')
 
 // Errors that look like the proxy is dead (TCP-level / DNS / handshake).
 // Anything in this set on a proxied request triggers proxy failover.
@@ -18,58 +19,43 @@ function isProxyShapedError(err) {
     if (!err) return false
     if (NETWORK_ERROR_CODES.has(err.code)) return true
     const msg = String(err.message || '')
-    return /timeout|ECONN|socket|ENETUNREACH|tunneling/.test(msg)
+    return /timeout|ECONN|socket|ENETUNREACH|tunneling|WAF_BLOCKED/.test(msg)
 }
 
 /**
- * Resolve the proxy decision for the current account. Returns the
- * three-mode object so callers can distinguish "no pool / no fixed url
- * → fall back to legacy single-proxy" from "operator explicitly chose
- * direct connection".
- *
- *   - mode='none'  → skip legacy fallback entirely (force direct)
- *   - mode='fixed' → use proxyUrl if set, else fall back to legacy
- *   - mode='smart' → pool binding if present, else fall back to legacy
- *
- * @param {string} email
- * @returns {Promise<{mode:'smart'|'fixed'|'none', proxyUrl:string|null}>}
+ * Resolve the proxy decision for the current account.
  */
 async function resolveAccountProxy(email) {
     if (!email) return { mode: 'smart', proxyUrl: null }
     if (typeof accountManager.getProxyDecisionForAccount === 'function') {
         return await accountManager.getProxyDecisionForAccount(email)
     }
-    // Legacy path (account-manager older than this feature) — preserve
-    // the old "string-or-null" contract by widening it here.
     if (!accountManager.proxyPool) return { mode: 'smart', proxyUrl: null }
     const url = await accountManager.getProxyForAccount(email)
     return { mode: 'smart', proxyUrl: url }
 }
 
 /**
- * Send chat request
- * Retries up to config.proxyMaxRetries times when the proxy looks dead.
- * Each retry asks the smart pool for a fresh binding.
- *
- * Side-effect: usageTracker.recordAccountAttempt is called on each
- * attempt, recordAccountFailure on per-attempt errors. Stream-level
- * success / token counts are NOT recorded here — the caller must
- * attach `usageTracker.attachStreamTracker(response, { apiKey, email })`
- * once it has the stream, since the upstream stream is consumed by the
- * caller and we don't want to double-instrument it.
+ * Resolve the effective proxy URL for a request.
+ * Returns null when direct connection is intended.
+ */
+function resolveEffectiveProxy(proxyDecision, currentProxy) {
+    if (proxyDecision.mode === 'none') return null
+    if (currentProxy) return currentProxy
+    // Legacy fallback: config.proxyUrl
+    return config.proxyUrl || null
+}
+
+/**
+ * Send chat request using HTTP/2
+ * 
+ * Uses Node.js native http2 module for TLS fingerprint alignment with
+ * real browsers. Includes cookies from Playwright browser login sessions.
  *
  * @param {Object} body - Request body
  * @returns {Promise<{status:boolean,response:Object|null,currentToken?:string,currentEmail?:string}>}
- *          On success: { status:true, response:stream, currentToken, currentEmail }.
- *          On failure: { status:false, response:null }.
  */
 const sendChatRequest = async (body) => {
-    // Wait for the (lazy, async) account-manager init before doing
-    // anything else. Without this, on Vercel's per-request isolated
-    // function instances, requests that arrive before _initialize()
-    // finishes its first signin call see token === '' and bail out
-    // with "Cannot get valid access token", even though the very next
-    // request (a few hundred ms later, after signin completes) succeeds.
     if (typeof accountManager.ensureInitialized === 'function') {
         try { await accountManager.ensureInitialized() } catch { /* fall through */ }
     }
@@ -78,8 +64,6 @@ const sendChatRequest = async (body) => {
     let lastError = null
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        // One rotator advance per attempt — picking a fresh account on
-        // retry is desirable too (the original token might be the cause).
         const accountInfo = accountManager.accountRotator
             && typeof accountManager.accountRotator.getNextAccountInfo === 'function'
             ? accountManager.accountRotator.getNextAccountInfo()
@@ -100,114 +84,70 @@ const sendChatRequest = async (body) => {
 
         // Anti-detection: random jitter before each request
         await requestJitter()
-        // Bump per-account "totalRequests" counter for this attempt. A
-        // single client request that retries N times will count as N
-        // attempts on the rotated accounts — that's intentional, it
-        // matches "what was actually asked of each upstream account".
+
         try { usageTracker.recordAccountAttempt({ email: currentEmail }) } catch { /* never block on stats */ }
 
         const proxyDecision = await resolveAccountProxy(currentEmail)
         const currentProxy = proxyDecision.proxyUrl
+        const effectiveProxy = resolveEffectiveProxy(proxyDecision, currentProxy)
+
+        // Get cookies from browser login session
+        const cookies = accountManager.getCookiesByEmail(currentEmail)
 
         try {
-            const chatBaseUrl = getChatBaseUrl()
-
-            const requestConfig = {
-                headers: {
-                    'Authorization': `Bearer ${currentToken}`,
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/event-stream",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Content-Type": "application/json",
-                    "Connection": "keep-alive",
-                    "Origin": chatBaseUrl,
-                    "Referer": `${chatBaseUrl}/`,
-                    "sec-ch-ua": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": "\"Windows\"",
-                    "Sec-Fetch-Dest": "empty",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-origin",
-                },
-                responseType: 'stream',
-                timeout: 60 * 1000,
-            }
-
-            // Agent selection rules:
-            //   - mode='none'  → no agent, force direct (skip legacy fallback)
-            //   - currentProxy set → build a per-URL agent
-            //   - else (smart with no pool / fixed with no URL) → legacy
-            //     single-proxy fallback (config.proxyUrl) if configured
-            let agent = null
-            if (proxyDecision.mode === 'none') {
-                agent = null
-            } else if (currentProxy) {
-                agent = buildAgentForUrl(currentProxy)
-            } else {
-                agent = getProxyAgent()
-            }
-            if (agent) {
-                requestConfig.httpAgent = agent
-                requestConfig.httpsAgent = agent
-                requestConfig.proxy = false
-            }
-
             const chat_id = await generateChatID(currentToken, body.model, currentEmail, currentProxy, proxyDecision.mode)
 
-            logger.network(`Sending chat request (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(currentProxy)})`, 'REQUEST')
-            const response = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id, {
-                ...body,
-                stream: true,
-                chat_id: chat_id
-            }, requestConfig)
+            logger.network(`Sending chat request via HTTP/2 (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(effectiveProxy)})`, 'REQUEST')
 
-            if (response.status === 200) {
-                logger.info(`[DEBUG] Request succeeded, status=200, content-type=${response.headers['content-type']}`, 'REQUEST')
+            const path = `/api/v2/chat/completions?chat_id=${chat_id}`
+            const payload = { ...body, stream: true, chat_id }
 
-                // Check content-type: WAF returns text/html instead of expected JSON/SSE
-                const contentType = response.headers['content-type'] || ''
-                if (contentType.includes('text/html')) {
-                    logger.error(`[RISK-CONTROL] WAF detected: got text/html instead of JSON/SSE (account: ${currentEmail}, proxy: ${getProxyHost(currentProxy)})`, 'REQUEST')
-                    accountRateLimiter.markLimited(currentEmail, 'waf_html_response')
-                    // Consume and discard the stream
-                    response.data.resume()
-                    lastError = new Error('WAF blocked: upstream returned HTML instead of SSE stream')
-                    if (attempt < MAX_RETRIES) continue
-                    break
-                }
+            const { status, stream, headers } = await http2Stream(path, payload, currentToken, cookies, {
+                proxyUrl: effectiveProxy,
+                timeout: 60000,
+            })
+
+            if (status === 200) {
+                logger.info(`[DEBUG] HTTP/2 request succeeded, status=200, content-type=${headers['content-type']}`, 'REQUEST')
 
                 // Clear rate limit on successful connection
                 accountRateLimiter.clearLimit(currentEmail)
 
-                // Schedule chat deletion after stream ends (reduce account footprint)
-                const chatBaseUrlForCleanup = getChatBaseUrl()
-                response.data.once('end', () => {
-                    deleteChatAfterUse(axios, chatBaseUrlForCleanup, currentToken, chat_id)
+                // Schedule chat deletion after stream ends
+                stream.once('end', () => {
+                    http2Request('DELETE', `/api/v2/chats/${chat_id}`, null, currentToken, cookies, {
+                        proxyUrl: effectiveProxy,
+                        timeout: 10000,
+                    }).catch(() => {})
                 })
 
                 return {
-                    currentToken: currentToken,
-                    currentEmail: currentEmail,
+                    currentToken,
+                    currentEmail,
                     status: true,
-                    response: response.data
+                    response: stream
                 }
             }
-            lastError = new Error(`Request failed with status code ${response.status}`)
+
+            lastError = new Error(`HTTP/2 request failed with status ${status}`)
             try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
+
         } catch (error) {
             lastError = error
             try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
-            logger.error(`Chat request failed (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(currentProxy)}): ${error.message}`, 'REQUEST')
+            logger.error(`Chat request failed (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(effectiveProxy)}): ${error.message}`, 'REQUEST')
 
-            // Only proxy-shaped errors are retryable. Auth errors, 4xx and
-            // upstream-format failures should bail immediately so the
-            // caller sees the real reason instead of "after 3 retries".
-            // Smart mode rotates to a new proxy; fixed mode marks failed
-            // but doesn't rebind (operator's intent is "always this proxy");
-            // direct mode never reaches here.
-            if (currentProxy && currentEmail && proxyDecision.mode === 'smart' && isProxyShapedError(error) && attempt < MAX_RETRIES) {
+            // WAF blocks should rate-limit the account and retry
+            if (error.message && error.message.includes('WAF_BLOCKED')) {
+                accountRateLimiter.markLimited(currentEmail, 'waf_blocked')
+                if (attempt < MAX_RETRIES) continue
+                break
+            }
+
+            // Proxy-shaped errors are retryable in smart mode
+            if (effectiveProxy && currentEmail && proxyDecision.mode === 'smart' && isProxyShapedError(error) && attempt < MAX_RETRIES) {
                 logger.warn('Proxy-shaped failure — rotating proxy and retrying', 'PROXY')
-                await accountManager.handleNetworkFailure(currentEmail, currentProxy)
+                await accountManager.handleNetworkFailure(currentEmail, effectiveProxy)
                 continue
             }
             break
@@ -221,18 +161,16 @@ const sendChatRequest = async (body) => {
 }
 
 /**
- * Generate chat_id
+ * Generate chat_id using HTTP/2
  * @param {string} currentToken - Current token
  * @param {string} model - Model name
- * @param {string} [email] - Account email (for proxy lookup)
- * @param {string} [proxyUrl] - Proxy URL (overrides legacy single-proxy)
- * @param {'smart'|'fixed'|'none'} [proxyMode] - Account proxy mode; when
- *        'none' we skip the legacy single-proxy fallback that would
- *        otherwise kick in for null proxyUrl.
+ * @param {string} [email] - Account email
+ * @param {string} [proxyUrl] - Proxy URL
+ * @param {'smart'|'fixed'|'none'} [proxyMode] - Account proxy mode
  * @returns {Promise<string|null>} Generated chat_id or null
  */
 const generateChatID = async (currentToken, model, email = null, proxyUrl = null, proxyMode = 'smart') => {
-    // Fast path: try the warmup pool first (avoids 500ms–6s /chats/new latency)
+    // Fast path: try the warmup pool first
     if (email) {
         const pooled = chatIdPool.acquire(email)
         if (pooled) {
@@ -241,53 +179,39 @@ const generateChatID = async (currentToken, model, email = null, proxyUrl = null
     }
 
     try {
-        const chatBaseUrl = getChatBaseUrl()
-
-        const requestConfig = {
-            headers: {
-                'Authorization': `Bearer ${currentToken}`,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Content-Type": "application/json",
-                "Connection": "keep-alive",
-                "Origin": chatBaseUrl,
-                "Referer": `${chatBaseUrl}/`,
-                "sec-ch-ua": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": "\"Windows\"",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin",
-            }
-        }
-
-        let agent = null
+        const cookies = accountManager.getCookiesByEmail(email)
+        let effectiveProxy = null
         if (proxyMode === 'none') {
-            agent = null
+            effectiveProxy = null
         } else if (proxyUrl) {
-            agent = buildAgentForUrl(proxyUrl)
+            effectiveProxy = proxyUrl
         } else {
-            agent = getProxyAgent()
-        }
-        if (agent) {
-            requestConfig.httpAgent = agent
-            requestConfig.httpsAgent = agent
-            requestConfig.proxy = false
+            effectiveProxy = config.proxyUrl || null
         }
 
-        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
-            "title": "New Chat",
-            "models": [model],
-            "chat_mode": "normal",
-            "chat_type": "t2t",
-            "timestamp": new Date().getTime()
-        }, requestConfig)
+        const { status, data } = await http2Request('POST', '/api/v2/chats/new', {
+            title: "New Chat",
+            models: [model],
+            chat_mode: "normal",
+            chat_type: "t2t",
+            timestamp: Date.now(),
+        }, currentToken, cookies, {
+            proxyUrl: effectiveProxy,
+            timeout: 15000,
+        })
 
-        return response_data.data?.data?.id || null
+        if (status === 200 && data && data.data && data.data.id) {
+            return data.data.id
+        }
 
+        // Check for WAF/error
+        if (status !== 200) {
+            logger.warn(`generateChatID got status ${status}`, 'CHAT')
+        }
+
+        return null
     } catch (error) {
-        logger.error('Failed to generate chat_id', 'CHAT', '', error.message)
+        logger.error(`Failed to generate chat_id: ${error.message}`, 'CHAT')
         return null
     }
 }
