@@ -116,7 +116,7 @@ const sendChatRequest = async (body) => {
                 headers: {
                     'Authorization': `Bearer ${currentToken}`,
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/plain, */*",
+                    "Accept": "application/json, text/event-stream",
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                     "Content-Type": "application/json",
                     "Connection": "keep-alive",
@@ -162,7 +162,19 @@ const sendChatRequest = async (body) => {
             }, requestConfig)
 
             if (response.status === 200) {
-                logger.info(`[DEBUG] Request succeeded, status=200, starting to stream response`, 'REQUEST')
+                logger.info(`[DEBUG] Request succeeded, status=200, content-type=${response.headers['content-type']}`, 'REQUEST')
+
+                // Check content-type: WAF returns text/html instead of expected JSON/SSE
+                const contentType = response.headers['content-type'] || ''
+                if (contentType.includes('text/html')) {
+                    logger.error(`[RISK-CONTROL] WAF detected: got text/html instead of JSON/SSE (account: ${currentEmail}, proxy: ${getProxyHost(currentProxy)})`, 'REQUEST')
+                    accountRateLimiter.markLimited(currentEmail, 'waf_html_response')
+                    // Consume and discard the stream
+                    response.data.resume()
+                    lastError = new Error('WAF blocked: upstream returned HTML instead of SSE stream')
+                    if (attempt < MAX_RETRIES) continue
+                    break
+                }
 
                 // Clear rate limit on successful connection
                 accountRateLimiter.clearLimit(currentEmail)
