@@ -1,4 +1,5 @@
 const axios = require('axios')
+const crypto = require('crypto')
 const accountManager = require('../utils/account.js')
 const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
 
@@ -28,6 +29,7 @@ const getLatestModels = async (force = false) => {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'x-request-id': crypto.randomUUID(),
             'Origin': chatBaseUrl,
             'Referer': `${chatBaseUrl}/`,
             'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',

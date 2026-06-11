@@ -1,4 +1,5 @@
 const axios = require('axios')
+const crypto = require('crypto')
 const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
@@ -120,6 +121,7 @@ const sendChatRequest = async (body) => {
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                     "Content-Type": "application/json",
                     "Connection": "keep-alive",
+                    "x-request-id": crypto.randomUUID(),
                     "Origin": chatBaseUrl,
                     "Referer": `${chatBaseUrl}/`,
                     "sec-ch-ua": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
@@ -251,6 +253,7 @@ const generateChatID = async (currentToken, model, email = null, proxyUrl = null
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 "Content-Type": "application/json",
                 "Connection": "keep-alive",
+                "x-request-id": crypto.randomUUID(),
                 "Origin": chatBaseUrl,
                 "Referer": `${chatBaseUrl}/`,
                 "sec-ch-ua": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
