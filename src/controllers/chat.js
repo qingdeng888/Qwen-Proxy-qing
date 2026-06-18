@@ -469,7 +469,42 @@ const handleChatCompletion = async (req, res) => {
 
         if (!response_data.status || !response_data.response) {
             try { usageTracker.recordFailure({ apiKey: req.apiKey }) } catch { /* swallow */ }
-            res.status(500).json({ error: "Failed to send request" })
+
+            // Return specific error based on failure reason
+            const reason = response_data.errorReason || 'unknown'
+            if (reason === 'captcha_challenge') {
+                res.status(503).json({
+                    error: {
+                        message: 'Service temporarily unavailable: upstream risk control triggered. The system is automatically recovering — please retry in 1-2 minutes.',
+                        type: 'captcha_challenge',
+                        code: 'risk_control_captcha'
+                    }
+                })
+            } else if (reason === 'rate_limited') {
+                res.status(429).json({
+                    error: {
+                        message: 'Too many requests: upstream rate limit reached. Please slow down and retry shortly.',
+                        type: 'rate_limited',
+                        code: 'upstream_rate_limit'
+                    }
+                })
+            } else if (reason === 'waf_blocked') {
+                res.status(503).json({
+                    error: {
+                        message: 'Service temporarily unavailable: upstream WAF protection triggered. The system is automatically recovering.',
+                        type: 'waf_blocked',
+                        code: 'risk_control_waf'
+                    }
+                })
+            } else {
+                res.status(500).json({
+                    error: {
+                        message: 'Failed to send request to upstream service.',
+                        type: 'upstream_error',
+                        code: 'request_failed'
+                    }
+                })
+            }
             return
         }
 

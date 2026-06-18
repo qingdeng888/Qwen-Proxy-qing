@@ -7,6 +7,7 @@ const usageTracker = require('./usage-tracker')
 const { chatIdPool } = require('./chat-id-pool')
 const { requestJitter, accountRateLimiter, detectUpstreamBlock, deleteChatAfterUse } = require('./request-fingerprint')
 const { http2Stream, http2Request } = require('./http2-client')
+const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 
 // Errors that look like the proxy is dead (TCP-level / DNS / handshake).
 // Anything in this set on a proxied request triggers proxy failover.
@@ -20,6 +21,85 @@ function isProxyShapedError(err) {
     if (NETWORK_ERROR_CODES.has(err.code)) return true
     const msg = String(err.message || '')
     return /timeout|ECONN|socket|ENETUNREACH|tunneling|WAF_BLOCKED/.test(msg)
+}
+
+// ─── Background Re-login Scheduler ─────────────────────────────────────────
+// When captcha/WAF blocks an account, schedule a Playwright re-login to
+// refresh the session's trust score. Uses a Set to avoid queueing
+// duplicate re-logins for the same account.
+
+const _pendingRelogins = new Set()
+
+/**
+ * Merge browser login cookies with ssxmod anti-bot cookies.
+ * ssxmod_itna and ssxmod_itna2 are Aliyun's client-side tracking cookies
+ * that help establish a "real browser" session fingerprint.
+ * @param {string} browserCookies - Cookie string from Playwright login session
+ * @returns {string} Combined cookie string
+ */
+function buildFullCookies(browserCookies) {
+    const parts = []
+
+    // Browser login cookies (session, auth, etc.)
+    if (browserCookies) {
+        parts.push(browserCookies)
+    }
+
+    // SSXMOD anti-bot cookies (refreshed every 15 min)
+    const ssxmodItna = getSsxmodItna()
+    const ssxmodItna2 = getSsxmodItna2()
+    if (ssxmodItna) {
+        parts.push(`ssxmod_itna=${ssxmodItna}`)
+    }
+    if (ssxmodItna2) {
+        parts.push(`ssxmod_itna2=${ssxmodItna2}`)
+    }
+
+    return parts.filter(Boolean).join('; ')
+}
+
+/**
+ * Schedule a background re-login for an account that hit captcha/WAF.
+ * Non-blocking — fires and forgets. Limits concurrency to one per email.
+ * 
+ * After successful re-login:
+ *   1. Clears the account's rate limit (so it can be used again)
+ *   2. Forces HTTP/2 session reconnect (old session may be tainted)
+ *   3. Refreshes ssxmod cookies (fresh fingerprint for the new session)
+ * 
+ * @param {string} email
+ */
+function scheduleBackgroundRelogin(email) {
+    if (!email || _pendingRelogins.has(email)) return
+    _pendingRelogins.add(email)
+
+    // Delay slightly to not hammer upstream immediately after a block
+    setTimeout(async () => {
+        try {
+            logger.info(`[RELOGIN] Background re-login starting for ${email}`, 'AUTH')
+            const success = await accountManager.refreshAccountToken(email)
+            if (success) {
+                logger.success(`[RELOGIN] Background re-login succeeded for ${email}, session refreshed`, 'AUTH')
+                // Clear rate limit since we have a fresh session
+                accountRateLimiter.clearLimit(email)
+                // Force HTTP/2 session reconnect — old session may be tainted
+                // by the WAF/captcha response and carry a bad reputation
+                const { closeHttp2 } = require('./http2-client')
+                closeHttp2()
+                logger.info(`[RELOGIN] HTTP/2 session reset for fresh connection`, 'AUTH')
+                // Refresh ssxmod cookies to get a new fingerprint
+                const { refreshCookies } = require('./ssxmod-manager')
+                refreshCookies()
+                logger.info(`[RELOGIN] SSXMOD cookies refreshed`, 'AUTH')
+            } else {
+                logger.warn(`[RELOGIN] Background re-login failed for ${email}`, 'AUTH')
+            }
+        } catch (err) {
+            logger.error(`[RELOGIN] Background re-login error for ${email}: ${err.message}`, 'AUTH')
+        } finally {
+            _pendingRelogins.delete(email)
+        }
+    }, 5000 + Math.random() * 10000) // 5-15s random delay
 }
 
 /**
@@ -44,6 +124,85 @@ function resolveEffectiveProxy(proxyDecision, currentProxy) {
     if (currentProxy) return currentProxy
     // Legacy fallback: config.proxyUrl
     return config.proxyUrl || null
+}
+
+// ─── Stream Peek Helpers ────────────────────────────────────────────────────
+// Read the first chunk from a stream to detect captcha/risk-control responses
+// before handing the stream to the response handler.
+
+const { PassThrough } = require('stream')
+
+/**
+ * Peek at the first chunk of a stream to detect upstream blocks.
+ * Waits up to `timeoutMs` for the first data event.
+ * @param {stream.Readable} stream - The HTTP/2 response stream
+ * @param {number} timeoutMs - Max time to wait for first chunk
+ * @returns {Promise<{blocked: boolean, reason: string, chunk: Buffer|null}>}
+ */
+function peekFirstChunk(stream, timeoutMs = 3000) {
+    return new Promise((resolve) => {
+        let resolved = false
+        const timer = setTimeout(() => {
+            if (resolved) return
+            resolved = true
+            // No data received within timeout — likely slow but not blocked
+            resolve({ blocked: false, reason: '', chunk: null })
+        }, timeoutMs)
+
+        stream.once('data', (chunk) => {
+            if (resolved) return
+            resolved = true
+            clearTimeout(timer)
+
+            const text = chunk.toString('utf-8')
+            const blockCheck = detectUpstreamBlock(text)
+            resolve({ blocked: blockCheck.blocked, reason: blockCheck.reason, chunk })
+        })
+
+        stream.once('end', () => {
+            if (resolved) return
+            resolved = true
+            clearTimeout(timer)
+            // Stream ended immediately with no data — unusual but not blocked
+            resolve({ blocked: false, reason: '', chunk: null })
+        })
+
+        stream.once('error', (err) => {
+            if (resolved) return
+            resolved = true
+            clearTimeout(timer)
+            resolve({ blocked: false, reason: '', chunk: null })
+        })
+    })
+}
+
+/**
+ * Create a PassThrough stream that first emits the peeked chunk,
+ * then pipes the rest of the original stream through.
+ * @param {stream.Readable} originalStream - The original HTTP/2 stream
+ * @param {Buffer|null} firstChunk - The peeked first chunk (or null if none)
+ * @returns {stream.PassThrough}
+ */
+function createPeekedStream(originalStream, firstChunk) {
+    const passthrough = new PassThrough()
+
+    // Emit the first chunk immediately if we have one
+    if (firstChunk) {
+        passthrough.write(firstChunk)
+    }
+
+    // Pipe remaining data through
+    originalStream.on('data', (chunk) => {
+        passthrough.write(chunk)
+    })
+    originalStream.on('end', () => {
+        passthrough.end()
+    })
+    originalStream.on('error', (err) => {
+        passthrough.destroy(err)
+    })
+
+    return passthrough
 }
 
 /**
@@ -91,8 +250,9 @@ const sendChatRequest = async (body) => {
         const currentProxy = proxyDecision.proxyUrl
         const effectiveProxy = resolveEffectiveProxy(proxyDecision, currentProxy)
 
-        // Get cookies from browser login session
-        const cookies = accountManager.getCookiesByEmail(currentEmail)
+        // Get cookies from browser login session + ssxmod anti-bot cookies
+        const browserCookies = accountManager.getCookiesByEmail(currentEmail)
+        const cookies = buildFullCookies(browserCookies)
 
         try {
             const chat_id = await generateChatID(currentToken, body.model, currentEmail, currentProxy, proxyDecision.mode)
@@ -110,6 +270,19 @@ const sendChatRequest = async (body) => {
             if (status === 200) {
                 logger.info(`[DEBUG] HTTP/2 request succeeded, status=200, content-type=${headers['content-type']}`, 'REQUEST')
 
+                // Peek at first chunk to detect captcha that slipped through content-type check
+                // (some captcha responses come as status=200 with event-stream content-type)
+                const firstChunkCheck = await peekFirstChunk(stream, 3000)
+                if (firstChunkCheck.blocked) {
+                    logger.error(`[RISK-CONTROL] First-chunk captcha detected for ${currentEmail}: ${firstChunkCheck.reason}`, 'REQUEST')
+                    accountRateLimiter.markLimited(currentEmail, firstChunkCheck.reason)
+                    scheduleBackgroundRelogin(currentEmail)
+                    stream.close ? stream.close() : stream.destroy ? stream.destroy() : null
+                    if (attempt < MAX_RETRIES) continue
+                    lastError = new Error(`CAPTCHA_BLOCKED: ${firstChunkCheck.reason}`)
+                    break
+                }
+
                 // Clear rate limit on successful connection
                 accountRateLimiter.clearLimit(currentEmail)
 
@@ -121,11 +294,14 @@ const sendChatRequest = async (body) => {
                     }).catch(() => {})
                 })
 
+                // Return a wrapped stream that prepends the peeked first chunk
+                const wrappedStream = createPeekedStream(stream, firstChunkCheck.chunk)
+
                 return {
                     currentToken,
                     currentEmail,
                     status: true,
-                    response: stream
+                    response: wrappedStream
                 }
             }
 
@@ -137,9 +313,36 @@ const sendChatRequest = async (body) => {
             try { usageTracker.recordAccountFailure({ email: currentEmail }) } catch { /* swallow */ }
             logger.error(`Chat request failed (attempt ${attempt}/${MAX_RETRIES}, proxy: ${getProxyHost(effectiveProxy)}): ${error.message}`, 'REQUEST')
 
+            // Captcha/risk-control blocks — rate-limit account and retry with different one
+            if (error.message && error.message.includes('CAPTCHA_BLOCKED')) {
+                accountRateLimiter.markLimited(currentEmail, 'captcha_challenge')
+                logger.warn(`[RISK-CONTROL] Account ${currentEmail} hit captcha, cooling down and retrying with next account`, 'REQUEST')
+                // Schedule background re-login to refresh session trust
+                scheduleBackgroundRelogin(currentEmail)
+                if (attempt < MAX_RETRIES) continue
+                break
+            }
+
+            // Rate-limited by upstream — shorter cooldown, still retry
+            if (error.message && error.message.includes('RATE_LIMITED')) {
+                accountRateLimiter.markLimited(currentEmail, 'rate_limited')
+                logger.warn(`[RATE-LIMIT] Account ${currentEmail} rate-limited upstream, retrying with next account`, 'REQUEST')
+                if (attempt < MAX_RETRIES) continue
+                break
+            }
+
             // WAF blocks should rate-limit the account and retry
             if (error.message && error.message.includes('WAF_BLOCKED')) {
                 accountRateLimiter.markLimited(currentEmail, 'waf_blocked')
+                // Schedule background re-login for WAF blocks too
+                scheduleBackgroundRelogin(currentEmail)
+                if (attempt < MAX_RETRIES) continue
+                break
+            }
+
+            // Generic upstream errors (unexpected JSON, etc.)
+            if (error.message && error.message.includes('UPSTREAM_ERROR')) {
+                logger.warn(`[UPSTREAM] Unexpected upstream response for ${currentEmail}, retrying`, 'REQUEST')
                 if (attempt < MAX_RETRIES) continue
                 break
             }
@@ -157,7 +360,15 @@ const sendChatRequest = async (body) => {
     if (lastError) {
         logger.error(`Failed to send chat request: ${lastError.message}`, 'REQUEST', '', lastError)
     }
-    return { status: false, response: null }
+    // Include error context so the controller can return a specific message
+    const errorReason = lastError && lastError.message
+        ? (lastError.message.includes('CAPTCHA_BLOCKED') ? 'captcha_challenge'
+            : lastError.message.includes('RATE_LIMITED') ? 'rate_limited'
+            : lastError.message.includes('WAF_BLOCKED') ? 'waf_blocked'
+            : lastError.message.includes('UPSTREAM_ERROR') ? 'upstream_error'
+            : 'unknown')
+        : 'unknown'
+    return { status: false, response: null, errorReason, errorMessage: lastError ? lastError.message : '' }
 }
 
 /**
@@ -179,7 +390,8 @@ const generateChatID = async (currentToken, model, email = null, proxyUrl = null
     }
 
     try {
-        const cookies = accountManager.getCookiesByEmail(email)
+        const browserCookies = accountManager.getCookiesByEmail(email)
+        const cookies = buildFullCookies(browserCookies)
         let effectiveProxy = null
         if (proxyMode === 'none') {
             effectiveProxy = null

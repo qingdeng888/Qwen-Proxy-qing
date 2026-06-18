@@ -159,7 +159,7 @@ const deleteChatAfterUse = async (axios, chatBaseUrl, token, chatId) => {
         await axios.delete(`${chatBaseUrl}/api/v2/chats/${chatId}`, {
             headers: {
                 'Authorization': `Bearer ${token}`,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
                 'Accept': 'application/json, text/plain, */*',
                 'Origin': chatBaseUrl,
                 'Referer': `${chatBaseUrl}/`,

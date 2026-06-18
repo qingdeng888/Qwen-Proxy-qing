@@ -39,13 +39,13 @@ function buildHeaders(token, cookies, extraHeaders = {}) {
     const headers = {
         ':method': 'POST',
         'authorization': `Bearer ${token}`,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
         'accept': 'application/json, text/event-stream',
         'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
         'content-type': 'application/json',
         'origin': QWEN_BASE_URL,
         'referer': `${QWEN_BASE_URL}/`,
-        'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Windows"',
         'sec-fetch-dest': 'empty',
@@ -356,6 +356,29 @@ async function http2Stream(path, body, token, cookies = '', options = {}) {
                 req.on('data', (chunk) => { body += chunk.toString() })
                 req.on('end', () => {
                     reject(new Error(`WAF_BLOCKED: upstream returned text/html (status=${status})`))
+                })
+                return
+            }
+
+            // Check for captcha/risk-control JSON response on streaming endpoint
+            // Normal streaming returns text/event-stream; if we get application/json
+            // it's almost always a captcha challenge or error response
+            if (contentType.includes('application/json') && !contentType.includes('event-stream')) {
+                let body = ''
+                req.on('data', (chunk) => { body += chunk.toString() })
+                req.on('end', () => {
+                    // Detect RGV587 captcha challenge
+                    if (body.includes('RGV587') || body.includes('_____tmd_____') || body.includes('FAIL_SYS_USER_VALIDATE') || body.includes('punish')) {
+                        reject(new Error(`CAPTCHA_BLOCKED: upstream returned captcha challenge (status=${status}, body=${body.slice(0, 300)})`))
+                        return
+                    }
+                    // Detect rate limit
+                    if (body.includes('too_many_requests') || body.includes('Too Many Requests')) {
+                        reject(new Error(`RATE_LIMITED: upstream rate limit (status=${status})`))
+                        return
+                    }
+                    // Other JSON error — still not a valid stream
+                    reject(new Error(`UPSTREAM_ERROR: unexpected JSON on stream endpoint (status=${status}, body=${body.slice(0, 200)})`))
                 })
                 return
             }
