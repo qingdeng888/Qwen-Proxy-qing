@@ -222,6 +222,7 @@ const sendChatRequestViaBridge = async (body, currentToken, currentEmail) => {
 
     try {
         // Step 1: Create chat_id via browser
+        logger.info(`[BRIDGE] Creating chat_id for ${currentEmail}...`, 'BRIDGE')
         const chatResult = await browserBridge.request(currentEmail, currentToken, 'POST', '/api/v2/chats/new', {
             title: "New Chat",
             models: [body.model],
