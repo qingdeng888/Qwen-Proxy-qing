@@ -8,6 +8,7 @@ const { chatIdPool } = require('./chat-id-pool')
 const { requestJitter, accountRateLimiter, detectUpstreamBlock, deleteChatAfterUse } = require('./request-fingerprint')
 const { http2Stream, http2Request } = require('./http2-client')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
+const { browserBridge } = require('./browser-bridge')
 
 // Errors that look like the proxy is dead (TCP-level / DNS / handshake).
 // Anything in this set on a proxied request triggers proxy failover.
@@ -206,10 +207,102 @@ function createPeekedStream(originalStream, firstChunk) {
 }
 
 /**
- * Send chat request using HTTP/2
+ * Send chat request via Browser Bridge (primary path when available).
+ * Routes the request through a persistent Playwright browser session where
+ * Alibaba's security SDK naturally generates x5sec for each request.
  * 
- * Uses Node.js native http2 module for TLS fingerprint alignment with
- * real browsers. Includes cookies from Playwright browser login sessions.
+ * @param {Object} body - Request body
+ * @param {string} currentToken - Auth token
+ * @param {string} currentEmail - Account email
+ * @returns {Promise<{status:boolean, response:Object|null, currentToken:string, currentEmail:string}|null>}
+ *          Returns null if bridge is not available (caller should fall back)
+ */
+const sendChatRequestViaBridge = async (body, currentToken, currentEmail) => {
+    if (!browserBridge.isAvailable()) return null
+
+    try {
+        // Step 1: Create chat_id via browser
+        const chatResult = await browserBridge.request(currentEmail, currentToken, 'POST', '/api/v2/chats/new', {
+            title: "New Chat",
+            models: [body.model],
+            chat_mode: "normal",
+            chat_type: "t2t",
+            timestamp: Date.now(),
+        })
+
+        // Check for captcha in chat creation response
+        const chatRaw = typeof chatResult.data === 'string' ? chatResult.data : JSON.stringify(chatResult.data || '')
+        if (chatRaw.includes('RGV587') || chatRaw.includes('_____tmd_____') || chatRaw.includes('FAIL_SYS_USER_VALIDATE')) {
+            logger.error(`[BRIDGE] Chat creation hit captcha for ${currentEmail}`, 'BRIDGE')
+            // Browser session is tainted — close and re-create on next use
+            await browserBridge.closeSession(currentEmail)
+            return null // Fall back to HTTP path
+        }
+
+        const chat_id = (chatResult.status === 200 && chatResult.data && chatResult.data.data)
+            ? chatResult.data.data.id
+            : null
+
+        if (!chat_id) {
+            logger.warn(`[BRIDGE] Failed to get chat_id via bridge for ${currentEmail} (status=${chatResult.status})`, 'BRIDGE')
+            return null
+        }
+
+        logger.info(`[BRIDGE] Chat created: ${chat_id} for ${currentEmail}`, 'BRIDGE')
+
+        // Step 2: Stream completion via browser
+        const path = `/api/v2/chat/completions?chat_id=${chat_id}`
+        const payload = { ...body, stream: true, chat_id }
+
+        const { status, stream, headers } = await browserBridge.stream(
+            currentEmail, currentToken, path, payload, { timeout: 60000 }
+        )
+
+        if (status === 200) {
+            // Check first bytes for captcha (might still happen in stream response)
+            const firstChunkCheck = await peekFirstChunk(stream, 3000)
+            if (firstChunkCheck.blocked) {
+                logger.error(`[BRIDGE] Stream first-chunk blocked for ${currentEmail}: ${firstChunkCheck.reason}`, 'BRIDGE')
+                await browserBridge.closeSession(currentEmail)
+                return null
+            }
+
+            const wrappedStream = firstChunkCheck.chunk ? createPeekedStream(stream, firstChunkCheck.chunk) : stream
+            logger.info(`[BRIDGE] Stream started for ${currentEmail}`, 'BRIDGE')
+
+            // Schedule chat deletion
+            wrappedStream.once('end', () => {
+                browserBridge.request(currentEmail, currentToken, 'DELETE', `/api/v2/chats/${chat_id}`)
+                    .catch(() => {})
+            })
+
+            return {
+                currentToken,
+                currentEmail,
+                status: true,
+                response: wrappedStream,
+            }
+        }
+
+        logger.warn(`[BRIDGE] Stream returned status ${status} for ${currentEmail}`, 'BRIDGE')
+        return null
+
+    } catch (error) {
+        logger.error(`[BRIDGE] Request failed for ${currentEmail}: ${error.message}`, 'BRIDGE')
+        // If it's a session error, close it for re-creation on next attempt
+        if (error.message.includes('not ready') || error.message.includes('crashed') || error.message.includes('Target closed')) {
+            await browserBridge.closeSession(currentEmail).catch(() => {})
+        }
+        return null
+    }
+}
+
+/**
+ * Send chat request using HTTP/2 (with HTTP/1.1 fallback)
+ * 
+ * Request strategy (in order):
+ *   1. Browser Bridge (routes through persistent Playwright — has x5sec)
+ *   2. HTTP/2 / HTTP/1.1 with cookies (fallback when bridge unavailable)
  *
  * @param {Object} body - Request body
  * @returns {Promise<{status:boolean,response:Object|null,currentToken?:string,currentEmail?:string}>}
@@ -241,6 +334,24 @@ const sendChatRequest = async (body) => {
             continue
         }
 
+        // ─── Strategy 1: Browser Bridge (preferred — has x5sec) ─────────
+        // Try routing through persistent browser session first.
+        // The browser's security SDK adds x5sec to each request automatically.
+        if (attempt === 1 && currentEmail && browserBridge.isAvailable()) {
+            try {
+                const bridgeResult = await sendChatRequestViaBridge(body, currentToken, currentEmail)
+                if (bridgeResult && bridgeResult.status) {
+                    accountRateLimiter.clearLimit(currentEmail)
+                    return bridgeResult
+                }
+                // Bridge returned null — fall through to HTTP path
+                logger.info('[BRIDGE] Browser bridge unavailable or failed, falling back to HTTP', 'REQUEST')
+            } catch (bridgeErr) {
+                logger.warn(`[BRIDGE] Error: ${bridgeErr.message}, falling back to HTTP`, 'REQUEST')
+            }
+        }
+
+        // ─── Strategy 2: HTTP/2 + HTTP/1.1 fallback ─────────────────────
         // Anti-detection: random jitter before each request
         await requestJitter()
 
