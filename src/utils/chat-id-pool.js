@@ -207,6 +207,14 @@ class ChatIdPool {
                 timeout: 15000,
             })
 
+            // Check if response is a captcha challenge disguised as 200
+            const rawStr = typeof data === 'string' ? data : JSON.stringify(data || '')
+            if (rawStr.includes('RGV587') || rawStr.includes('_____tmd_____') || rawStr.includes('FAIL_SYS_USER_VALIDATE')) {
+                logger.warn(`[ChatIdPool] Prewarm hit captcha for ${email}, skipping`, 'WARMUP')
+                this._stats.errors++
+                return
+            }
+
             const chatId = (status === 200 && data && data.data) ? data.data.id : null
             if (!chatId) {
                 logger.warn(`[ChatIdPool] Prewarm got empty chatId for ${email} (status=${status})`, 'WARMUP')

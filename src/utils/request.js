@@ -416,6 +416,15 @@ const generateChatID = async (currentToken, model, email = null, proxyUrl = null
             return data.data.id
         }
 
+        // Check for captcha/WAF in response body
+        const rawStr = typeof data === 'string' ? data : JSON.stringify(data || '')
+        if (rawStr.includes('RGV587') || rawStr.includes('_____tmd_____') || rawStr.includes('FAIL_SYS_USER_VALIDATE')) {
+            logger.warn(`generateChatID hit captcha for ${email}`, 'CHAT')
+            accountRateLimiter.markLimited(email, 'captcha_in_chatid')
+            scheduleBackgroundRelogin(email)
+            return null
+        }
+
         // Check for WAF/error
         if (status !== 200) {
             logger.warn(`generateChatID got status ${status}`, 'CHAT')
