@@ -1,8 +1,9 @@
 # ─────────────────────────────────────────────────────────────
 # Stage 1 — Backend dependencies
 #   Production-only, cached separately from source for fast rebuilds.
+#   Uses Debian slim (same as runtime) for native module compatibility.
 # ─────────────────────────────────────────────────────────────
-FROM node:20-alpine AS deps
+FROM node:20-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev --no-audit --no-fund
@@ -32,22 +33,63 @@ RUN npm run build
 
 # ─────────────────────────────────────────────────────────────
 # Stage 3 — Runtime image
-#   Slim Alpine with only what's needed to `node src/start.js`.
-#   Includes the prebuilt webui/dist so the admin panel is served
-#   out of the box (the panel is required to use the v1.1.2 PR
-#   features: API-key management, per-account proxy mode, on-demand
-#   proxy test, usage stats).
+#   Debian slim with Playwright Chromium for browser-based login
+#   (bypasses Aliyun WAF/captcha). Serves the prebuilt webui/dist
+#   admin panel out of the box.
+#
+#   Why not Alpine? Playwright/Chromium requires glibc; Alpine
+#   uses musl which is incompatible with the prebuilt binaries.
 # ─────────────────────────────────────────────────────────────
-FROM node:20-alpine AS runner
+FROM node:20-slim AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
+# Playwright needs this to find browsers in the expected location
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
+
+# Install system dependencies required by Playwright Chromium
+# (fonts, graphics libs, dbus, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    fonts-liberation \
+    fonts-noto-cjk \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libexpat1 \
+    libgbm1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    libxshmfence1 \
+    wget \
+    xdg-utils \
+  && rm -rf /var/lib/apt/lists/*
 
 # Backend node_modules + source
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
 COPY api ./api
+
+# Install Playwright Chromium browser binary
+# This step uses the playwright version from node_modules
+RUN npx playwright install chromium
 
 # Prebuilt frontend bundle — server.js mounts this as static when present
 COPY --from=webui-builder /app/webui/dist ./webui/dist

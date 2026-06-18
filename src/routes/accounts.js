@@ -74,15 +74,28 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
       return res.status(409).json({ error: 'Account already exists' })
     }
 
-    const authToken = await accountManager.login(email, password)
+    const loginResult = await accountManager.login(email, password)
+    const authToken = loginResult && loginResult.token ? loginResult.token : loginResult
     if (!authToken) {
       return res.status(401).json({ error: 'Login failed' })
     }
 
     const decoded = JwtDecode(authToken)
-    const expires = decoded.exp
+    if (!decoded || !decoded.exp) {
+      // Token is valid but not a standard JWT (e.g. opaque token from Qwen).
+      // Use a generous fallback expiry (7 days from now) so the account
+      // still gets added and the rotator can use it.
+      logger.warn(`Token for ${email} is not a decodable JWT, using fallback expiry`, 'ACCOUNT')
+    }
+    const expires = (decoded && decoded.exp) ? decoded.exp : Math.floor(Date.now() / 1000) + 7 * 24 * 3600
+    const cookies = (loginResult && loginResult.cookies) || ''
 
     const success = await accountManager.addAccountWithToken(email, password, authToken, expires)
+    // Persist cookies from browser login session if available
+    if (success && cookies) {
+      const acc = accountManager.accountTokens.find(a => a.email === email)
+      if (acc) acc.cookies = cookies
+    }
 
     if (success) {
       // NOTE: deliberately NOT auto-syncing to Vercel here. Pushing
